@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  <strong>Version 0.2.0</strong> — Self-hosted backend for a persistent character companion.<br>
+  <strong>Version 0.3.0</strong> — Self-hosted backend for a persistent character companion.<br>
   <em>Lightweight. General-purpose. Privacy-first.</em>
 </p>
 
@@ -177,11 +177,17 @@ redis-cli -h 127.0.0.1 ping           # on the server
 ## Configuration
 
 `core.env.template` documents every variable with safe behavior-inert
-defaults. Real environment variables override file values. Invalid numeric or
+defaults; `core.env.full.example` shows the intended single-owner enabled
+profile. Real environment variables override file values. Invalid numeric or
 boolean values fail startup with a clear message. Secrets are never exposed
 via `/status` or logs.
 
-## Repository layout (milestone 0.2.0)
+Needs/interaction tuning (thresholds, rates, turn effects, bid caps, owner
+profile floors) lives in `schedule/needs.json` — the bundled values are
+engine-safe neutrals, not character calibration; tune them for your
+deployment.
+
+## Repository layout (milestone 0.3.0)
 
 ```text
 bridge_core.py            entrypoint
@@ -191,18 +197,27 @@ core/
   config.py               Config dataclass, core.env loader, hot reload
   constants.py            VERSION, emotion palette, Redis key helpers
   cache.py                async Redis wrapper (required service)
-  connections.py          multi-device ConnectionManager, per-owner turn lock
+  connections.py          multi-device ConnectionManager, per-owner locks
   llm.py                  provider router with failover
   speech.py               ElevenLabs TTS, Deepgram/AssemblyAI STT, audio validation
   static_lines.py         owner-authored no-LLM speech lines (blank = silence)
   static_lines.json       bundled schema-complete empty line tables
   history.py              companion history rows and delivery states
-  prompts.py              companion prompt builder (structural laws)
+  prompts.py              companion + owner-profile analysis prompt builders
   text_utils.py           emotion segment parsing, scrubbers, TTS chunking
   tailscale.py            bind validation (section 27.2)
   emotions.py             manifest loading/validation
   emotions.json           bundled neutral emotion manifest
+  needs.py                needs engine: evaluate/peek, zones, turn effects
+  bids.py                 connection bids (registration arrives with initiative)
+  rhythm.py               metadata-only owner-availability histograms
+  state_expression.py     [CHARACTER STATE] block from STATE.md zones
+  owner_profile.py        owner lived profile: boundaries, soft block, agreements,
+                          strict-JSON proposals, status drift
+  routes/profiles.py      GET/PATCH /profiles/owner (mistake-guard token)
+  routes/state.py         read-only GET /state
 identity/                 SOUL.md / PROFILE.md / STATE.md blank templates
+schedule/needs.json       needs/interaction tuning template (conservative defaults)
 tests/                    unittest suite (no live services required)
 ```
 
@@ -213,18 +228,21 @@ tests/                    unittest suite (no live services required)
 
 Milestone 0.1.0 scope: core transport (HTTP + WebSocket), text-only companion turns, multi-device `chat_sync`, heartbeats, the Fireworks/Chutes/Ollama/OpenAI-compatible LLM router, history persistence, and the health/status/emotions endpoints.
 
-Milestone 0.2.0 scope (current): the speech and emotion pipeline — ElevenLabs TTS with sequential pipelined audio chunks (`done` always precedes chunks), Deepgram and AssemblyAI STT with strict audio payload validation, per-segment emotion parsing with control-tag/reasoning scrubbing, thinking status frames, the emotion-only retry, per-message language pins (en/es/ja), and owner-authored static lines (blank = protocol-only silence) for empty/failed STT. Audio is never stored server-side.
+Milestone 0.2.0 scope: the speech and emotion pipeline — ElevenLabs TTS with sequential pipelined audio chunks (`done` always precedes chunks), Deepgram and AssemblyAI STT with strict audio payload validation, per-segment emotion parsing with control-tag/reasoning scrubbing, thinking status frames, the emotion-only retry, per-message language pins (en/es/ja), and owner-authored static lines (blank = protocol-only silence) for empty/failed STT. Audio is never stored server-side.
+
+Milestone 0.3.0 scope (current): needs, interaction, and the owner lived profile — the `schedule/needs.json` tuning template with stats/zones/turn effects/critical shutdown, read-only `GET /state` polls, connection bids (deterministic reply satisfaction + expiry sweep; registration arrives with initiative), metadata-only rhythm histograms, and the owner lived profile: boundary penalties (EN/ES/JA classifiers, metadata-only), reversible soft block (no LLM/bids/history writes; one authored distance line per cooldown), agreements (cap 12 active, persona-tension floors), strict-JSON proposal chain (validated/clamped, raw text never stored), status drift, and agreement aftermath. `GET/PATCH /profiles/owner` ship with the `UPDATE_OWNER_PROFILE` mistake-guard token, and the owner's preferred language joins the reply-language fallback. All of it is flag-gated OFF by default.
 
 Planned (behind flags that default OFF):
-- Needs & emotional simulation
 - Schedule & availability
 - Work mode (agentic tool use)
 - Long-term memory
 - Initiative & proactive reach-out
 
-Speech flags (`TTS_ENABLED`, `STT_ENABLED`) default OFF; when off, the
-`connected` capabilities omit `audio`/`voice_input` and audio frames return a
-terminal `stt_unavailable` error.
+Speech flags (`TTS_ENABLED`, `STT_ENABLED`) and the 0.3.0 flags
+(`NEEDS_ENABLED`, `BIDS_ENABLED`, `RHYTHM_ENABLED`, `STATE_EXPRESSION_ENABLED`,
+`OWNER_PROFILE_ENABLED` and sub-flags) default OFF; when off, none of their
+stores, prompt blocks, background tasks, or LLM calls run. See
+`core.env.full.example` for the intended single-owner enabled profile.
 
 ## License
 

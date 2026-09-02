@@ -57,6 +57,7 @@ class FakeRedis:
 
     def __init__(self) -> None:
         self.store: dict[str, list[str]] = {}
+        self.strings: dict[str, str] = {}
         self.up = True
 
     async def ping(self) -> bool:
@@ -81,11 +82,24 @@ class FakeRedis:
     async def llen(self, key: str) -> int:
         return len(self.store.get(key, []))
 
+    async def set(self, key: str, value: str) -> bool:
+        self.strings[key] = value
+        return True
+
+    async def get(self, key: str) -> str | None:
+        return self.strings.get(key)
+
     async def delete(self, key: str) -> int:
-        return 1 if self.store.pop(key, None) is not None else 0
+        removed = 0
+        if self.store.pop(key, None) is not None:
+            removed += 1
+        if self.strings.pop(key, None) is not None:
+            removed += 1
+        return removed
 
     async def keys(self, pattern: str = "*") -> list[str]:
-        return [k for k in self.store if fnmatch.fnmatch(k, pattern)]
+        all_keys = set(self.store) | set(self.strings)
+        return [k for k in all_keys if fnmatch.fnmatch(k, pattern)]
 
     async def aclose(self) -> None:
         pass
@@ -225,3 +239,75 @@ def make_config(**overrides: Any) -> Config:
 def make_cache(fake: FakeRedis | None = None) -> tuple[RedisCache, FakeRedis]:
     fake = fake or FakeRedis()
     return RedisCache(fake), fake
+
+
+class FakeNeeds:
+    """Scriptable needs-engine substitute for WS integration tests.
+
+    Surfaces only what ``core.bridge`` consumes: availability, soft-block
+    status/line, bid satisfaction, turn effects, boundary recording, and the
+    per-turn ``evaluate`` used to build the state block.
+    """
+
+    def __init__(self, config: Config, cache: RedisCache, available: bool = False) -> None:
+        self.config = config
+        self.cache = cache
+        self.available_flag = available
+        self.spec: dict = {}
+        self.zones: dict = {}
+        self.evaluate_calls = 0
+
+    @property
+    def available(self) -> bool:
+        return self.available_flag
+
+    def load_spec(self) -> None:
+        self.spec = {"version": 1}
+
+    async def evaluate(self, owner: str, activity: str = "default") -> dict:
+        self.evaluate_calls += 1
+        return {
+            "values": {},
+            "zones": dict(self.zones),
+            "shutdown": False,
+            "skipped_gap_count": 0,
+            "last_eval_ts": 0.0,
+        }
+
+    async def turn_effects(self, owner: str, kind: str) -> None:
+        return None
+
+
+class FakeOwnerProfile:
+    """Scriptable owner-profile substitute for WS integration tests."""
+
+    def __init__(self, config: Config, cache: RedisCache, available: bool = False,
+                 blocked: bool = False) -> None:
+        self.config = config
+        self.cache = cache
+        self.available_flag = available
+        self.blocked = blocked
+        self.soft_block_line_text: str | None = None
+        self.recorded_boundaries: list[tuple[str, str]] = []
+        self.tuning: dict = {}
+
+    @property
+    def available(self) -> bool:
+        return self.available_flag
+
+    async def soft_block_status(self, owner: str) -> dict:
+        return {"blocked": self.blocked}
+
+    def soft_block_line(self, static_lines: dict, language: str) -> str | None:
+        return self.soft_block_line_text
+
+    async def record_boundary(self, owner: str, text: str, language: str,
+                              activity: str = "companion"):
+        self.recorded_boundaries.append((text, language))
+        return []
+
+    async def get(self, owner: str):
+        return None
+
+    async def mark_soft_block_notice(self, owner: str) -> None:
+        return None

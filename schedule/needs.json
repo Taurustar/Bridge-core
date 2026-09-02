@@ -1,0 +1,42 @@
+{
+  "_readme": [
+    "Bridge Core Engine needs/interaction template (plan section 15).",
+    "These are engine-safe starting values, not character calibration.",
+    "Tune every number for your deployment. Thresholds, rates, effects, and",
+    "caps live here, never in engine code. All timestamps are UTC seconds.",
+    "direction: higher_is_better means low values map to low/critical zones;",
+    "lower_is_better means high values map to low/critical zones.",
+    "Keys starting with '_' are ignored by the loader."
+  ],
+  "version": 1,
+  "stats": {
+    "energy": {"start": 70, "direction": "higher_is_better", "low_below": 35, "critical_below": 15, "rate_per_hour": -1.0},
+    "hunger": {"start": 20, "direction": "lower_is_better", "low_above": 55, "critical_above": 80, "rate_per_hour": 1.5},
+    "stress": {"start": 20, "direction": "lower_is_better", "low_above": 55, "critical_above": 80, "rate_per_hour": -0.25},
+    "social_battery": {"start": 70, "direction": "higher_is_better", "low_below": 35, "critical_below": 15, "rate_per_hour": 0.5},
+    "fun": {"start": 60, "direction": "higher_is_better", "low_below": 35, "critical_below": 15, "rate_per_hour": -0.5},
+    "bond": {"start": 50, "direction": "higher_is_better", "strained_below": 35, "deprived_below": 15, "rate_per_hour": -0.05},
+    "hurt": {"start": 0, "direction": "lower_is_better", "low_above": 25, "critical_above": 60, "rate_per_hour": -0.2}
+  },
+  "activity_multipliers": {},
+  "turn_effects": {
+    "companion_brief": {"bond": 0.2, "social_battery": -0.1},
+    "companion_engaged": {"bond": 0.5, "social_battery": -0.25},
+    "work": {"energy": -0.1, "stress": 0.1}
+  },
+  "shutdown": {"enabled": false, "energy_below": 10, "social_battery_below": 10},
+  "bids": {
+    "open_bid_lifetime_seconds": 1209600,
+    "max_open_bids": 4,
+    "min_gap_between_bids_seconds": 3600,
+    "reply_satisfy_bonus": 2.0,
+    "reply_quality_lengths": [8, 400]
+  },
+  "owner_profile": {
+    "soft_block_trust_threshold": 20,
+    "agreement_tension_trust_floor": 50,
+    "agreement_tension_closeness_floor": 40,
+    "agreement_max_active": 12,
+    "max_boundary_events": 50
+  }
+}

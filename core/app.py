@@ -150,12 +150,31 @@ def create_app(
             "features": bridge.feature_summary(),
             "identity_files": bridge.identity_info(),
             "emotions_manifest_version": bridge.emotions_manifest.get("version"),
+            "needs": {
+                "enabled": bridge.needs.available,
+                "profile_loaded": bool(bridge.needs.spec),
+                "state_expression": cfg.STATE_EXPRESSION_ENABLED,
+            },
+            "owner_profile": {
+                "enabled": bridge.owner_profile.available,
+                "inject": cfg.OWNER_PROFILE_INJECT,
+                "boundary_penalties": cfg.OWNER_BOUNDARY_PENALTIES_ENABLED,
+                "soft_block": cfg.OWNER_SOFT_BLOCK_ENABLED,
+                "llm_analysis": cfg.OWNER_PROFILE_LLM_ENABLED,
+                "agreements": cfg.OWNER_AGREEMENTS_ENABLED,
+            },
             "connections": len(bridge.connections.connections_for(cfg.OWNER_USER_ID)),
         }
 
     @app.get("/emotions")
     async def emotions():
         return bridge.emotions_manifest
+
+    from .routes.profiles import register_profile_routes
+    from .routes.state import register_state_routes
+
+    register_profile_routes(app, bridge)
+    register_state_routes(app, bridge)
 
     @app.post("/message")
     async def message(request: Request):
@@ -216,7 +235,8 @@ def create_app(
                 )
             language = language.strip().lower()
         else:
-            language = bridge.config.DEFAULT_LANGUAGE
+            preferred = await bridge._owner_preferred_language()
+            language = preferred or bridge.config.DEFAULT_LANGUAGE
         done = await bridge.run_companion_turn(
             text=text, language=language, source_conn=None
         )

@@ -10,6 +10,7 @@ from core.config import Config, ConfigError
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TEMPLATE = REPO_ROOT / "core.env.template"
+FULL_EXAMPLE = REPO_ROOT / "core.env.full.example"
 
 
 class ConfigDefaultsTest(unittest.TestCase):
@@ -81,6 +82,21 @@ class ConfigDefaultsTest(unittest.TestCase):
         with self.assertRaises(ConfigError) as ctx:
             Config.from_env(env_file=None, environ={"LLM_CHAIN": "fireworks,mystery"})
         self.assertIn("mystery", str(ctx.exception))
+
+    def test_full_example_parses_and_enables_owner_features(self):
+        """Plan section 8.4: the full single-owner profile must parse."""
+        config = Config.from_env(env_file=str(FULL_EXAMPLE), environ={})
+        self.assertTrue(config.NEEDS_ENABLED)
+        self.assertTrue(config.OWNER_PROFILE_ENABLED)
+        self.assertTrue(config.OWNER_PROFILE_INJECT)
+        self.assertTrue(config.OWNER_BOUNDARY_PENALTIES_ENABLED)
+        self.assertTrue(config.OWNER_SOFT_BLOCK_ENABLED)
+        self.assertTrue(config.OWNER_STATUS_DRIFT_ENABLED)
+        self.assertTrue(config.OWNER_AGREEMENTS_ENABLED)
+        self.assertTrue(config.OWNER_AGREEMENT_AFTERMATH_ENABLED)
+        # External-profile behavior stays off even in the full profile.
+        self.assertFalse(config.EXTERNAL_USER_PROFILES_BEHAVIOR_ENABLED)
+        self.assertFalse(config.EXTERNAL_USER_PROFILE_LLM_ENABLED)
 
     def test_apply_hot_reloads_non_structural_only(self):
         live = Config.from_env(env_file=None, environ={})

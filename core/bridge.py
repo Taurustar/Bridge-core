@@ -1,19 +1,24 @@
-"""Bridge: wiring and companion turn lifecycle (plan sections 10-12, 14).
+"""Bridge: wiring and companion turn lifecycle (plan sections 10-12, 14-15, 18).
 
-Holds the config, cache, connection manager, LLM router, and speech services,
-and implements the milestone 0.2.0 companion turn (text and audio), heartbeat
-handling, status frames, and the sequential pipelined TTS chunk stream.
+Holds the config, cache, connection manager, LLM router, speech services, and
+the 0.3.0 needs/interaction/owner-profile engines, and implements the companion
+turn (text and audio), heartbeat handling, status frames, and the sequential
+pipelined TTS chunk stream.
 
-Turn lifecycle (needs/bids/schedule/profile/memory hooks do not exist yet and
-are flag-off inert):
+Turn lifecycle (schedule/availability, memory, life, catch-up, and initiative
+hooks do not exist yet and remain flag-off inert):
 
-validate owner -> non-empty text -> status(thinking) to source -> per-owner
-turn lock -> persist user row (delivered) BEFORE provider call -> fan out user
-chat_sync -> load bounded delivered history -> build prompt -> LLM router ->
-validate/parse reply segments (emotion-only retried once) -> append assistant
-row (pending) -> send done to source -> delivered: mark delivered + fan out
-assistant chat_sync; failed: mark undelivered, excluded from future prompts ->
-release lock -> pipelined sequential TTS chunks to the source connection only.
+validate owner -> non-empty text -> soft-block gate (plan 12 step 5; while
+blocked: one authored distance line per cooldown, no LLM/bids/history writes)
+-> status(thinking) to source -> rhythm stamp -> per-owner turn lock -> bid
+satisfaction -> persist user row (delivered) BEFORE provider call -> fan out
+user chat_sync -> needs evaluate + [CHARACTER STATE] + owner lived profile
+blocks -> build prompt -> LLM router -> validate/parse reply segments
+(emotion-only retried once) -> append assistant row (pending) -> send done to
+source -> delivered: mark delivered + fan out assistant chat_sync + needs turn
+effects; failed: mark undelivered, excluded from future prompts -> release
+lock -> strict-JSON owner-profile analysis (flag-gated, background) ->
+pipelined sequential TTS chunks to the source connection only.
 
 Every turn terminates with a ``done`` frame or a terminal error frame (plan
 section 30.2). Empty/failed STT returns a localized static line (or
@@ -34,6 +39,7 @@ from typing import Any
 from fastapi import WebSocket, WebSocketDisconnect
 
 from . import history as hist
+from .bids import BidsEngine
 from .cache import RedisCache
 from .config import Config
 from .connections import Connection, ConnectionManager
@@ -48,7 +54,16 @@ from .constants import (
 )
 from .emotions import load_emotions_manifest
 from .llm import LLMChainExhausted, LLMResult, LLMRouter
-from .prompts import build_companion_prompt
+from .needs import NeedsEngine, classify_turn_kind
+from .owner_profile import (
+    PROPOSAL_MAX_DELTA,
+    OwnerProfile,
+    default_profile,
+    owner_relationship_block,
+    validate_and_apply_proposal,
+)
+from .prompts import build_companion_prompt, build_owner_profile_analysis_prompt
+from .rhythm import RhythmEngine
 from .speech import (
     AudioValidationError,
     SpeechProviderError,
@@ -58,6 +73,7 @@ from .speech import (
     decode_audio,
     load_voice_profile,
 )
+from .state_expression import build_state_block
 from .static_lines import get_static_line, load_static_lines
 from .text_utils import chunk_segments, join_segments, parse_emotion_segments
 
@@ -66,6 +82,32 @@ log = logging.getLogger("bridge.turn")
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 _MAX_SEQUENCE = 2**64 - 1
+
+# Strict-JSON proposal clamp for background analysis (plan section 18.6).
+OWNER_PROPOSAL_MAX_DELTA = PROPOSAL_MAX_DELTA
+
+
+def _parse_strict_json_object(raw: str) -> dict | None:
+    """Parse an LLM proposal that must be a strict JSON object.
+
+    Tolerates markdown fences (a common provider habit) but accepts no prose:
+    anything that is not exactly one JSON object parses as None.
+    """
+    text = (raw or "").strip()
+    if text.startswith("```"):
+        first_newline = text.find("\n")
+        if first_newline != -1:
+            text = text[first_newline + 1 :]
+        if text.rstrip().endswith("```"):
+            text = text.rstrip()[:-3]
+        text = text.strip()
+    if not text.startswith("{") or not text.endswith("}"):
+        return None
+    try:
+        proposal = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    return proposal if isinstance(proposal, dict) else None
 
 
 def error_frame(code: str, message: str, details: dict | None = None, terminal: bool = False) -> dict:
@@ -109,12 +151,17 @@ class Bridge:
         self.connections = connections or ConnectionManager()
         self.stt = stt or STTService(config)
         self.tts = tts or TTSService(config)
+        self.needs = NeedsEngine(config, cache)
+        self.bids = BidsEngine(config, cache)
+        self.rhythm = RhythmEngine(config, cache)
+        self.owner_profile = OwnerProfile(config, cache)
         self.emotions_manifest: dict = {}
         self.static_lines: dict = {}
         self.deployment_mode = "unknown"
         self.background_tasks: set[asyncio.Task] = set()
         self._identity_cache: dict[str, tuple[float, str]] = {}
         self._started_monotonic = time.monotonic()
+        self._last_bid_sweep = 0.0
 
     # -- startup -------------------------------------------------------------
 
@@ -128,6 +175,14 @@ class Bridge:
                 load_voice_profile(self.config.TTS_VOICE_PROFILE_FILE.strip())
             )
         self.static_lines = load_static_lines(self.config.STATIC_LINES_FILE or None)
+        # Needs/interaction engines (plan section 15) and the owner lived
+        # profile (plan section 18). Flags default OFF; load/validate only
+        # when enabled so an inert deployment never touches stores.
+        if self.config.NEEDS_ENABLED or self.config.STATE_EXPRESSION_ENABLED:
+            self.needs.load_spec()
+            self.owner_profile.tuning = self.needs.owner_profile_config()
+        if self.config.OWNER_PROFILE_ENABLED:
+            self.owner_profile.tuning = self.needs.owner_profile_config()
 
     def capabilities(self) -> list[str]:
         """What this build actually supports right now (see SPEC)."""
@@ -272,8 +327,9 @@ class Bridge:
         """Per-message language pin (plan section 7.4).
 
         Returns the pinned language, or None when the caller should fall back
-        (absent field -> STT language detection -> DEFAULT_LANGUAGE). Raises
-        ValueError with a message for explicit invalid values.
+        (absent field -> owner profile -> STT language detection ->
+        DEFAULT_LANGUAGE). Raises ValueError with a message for explicit
+        invalid values.
         """
         language = frame.get("language")
         if language is None or language == "":
@@ -281,6 +337,18 @@ class Bridge:
         if not isinstance(language, str) or language.strip().lower() not in SUPPORTED_LANGUAGES:
             raise ValueError(f"Unsupported reply language: {language!r}")
         return language.strip().lower()
+
+    async def _owner_preferred_language(self) -> str | None:
+        """Owner lived-profile preferred language (plan 7.4 step 2).
+
+        Joins the fallback between the explicit pin and inbound-language
+        detection; blank/absent means no preference.
+        """
+        if not self.owner_profile.available:
+            return None
+        profile = await self.owner_profile.get(self.config.OWNER_USER_ID)
+        language = (profile or {}).get("preferred_language", "")
+        return language if language in SUPPORTED_LANGUAGES else None
 
     async def _handle_text_frame(self, conn: Connection, frame: dict) -> None:
         mode = frame.get("mode", "companion")
@@ -315,7 +383,9 @@ class Bridge:
             )
             return
         if language is None:
-            language = self.config.DEFAULT_LANGUAGE
+            language = (
+                await self._owner_preferred_language() or self.config.DEFAULT_LANGUAGE
+            )
         text = frame.get("text")
         wants_audio = bool(frame.get("wants_audio"))
         # Run the turn in a background task so the reader loop keeps serving
@@ -396,8 +466,10 @@ class Bridge:
             stt_language = stt_language.strip()
         else:
             stt_language = self.config.STT_LANGUAGE
-        # Clear inbound-language detection (plan 7.4 step 3): the spoken
-        # language pins the reply language when the frame did not.
+        # Clear inbound-language detection (plan 7.4 steps 2-4): owner-profile
+        # preferred language, then the spoken language, then the default.
+        if language is None:
+            language = await self._owner_preferred_language()
         if language is None:
             language = (
                 stt_language.lower()
@@ -550,8 +622,62 @@ class Bridge:
                 "counted": counted,
             }
         )
+        # Bids expire deterministically; sweep during heartbeat maintenance
+        # at most once per minute (plan section 15.5).
+        now = time.monotonic()
+        if self.bids.available and now - self._last_bid_sweep >= 60.0:
+            self._last_bid_sweep = now
+            sweep_task = asyncio.create_task(self._sweep_bids(owner_id=conn.user_id))
+            self.background_tasks.add(sweep_task)
+            sweep_task.add_done_callback(self.background_tasks.discard)
+
+    async def _sweep_bids(self, owner_id: str) -> None:
+        try:
+            await self.bids.sweep_expired(owner_id)
+        except Exception:  # noqa: BLE001 - maintenance never fails heartbeats
+            log.debug("bid sweep failed", exc_info=True)
 
     # -- companion turn -----------------------------------------------------------
+
+    async def _maybe_soft_block(
+        self, owner: str, language: str, source_conn: Connection | None
+    ) -> dict | None:
+        """Owner-profile soft block gate (plan sections 12 step 5, 18.4).
+
+        While blocked: one owner-authored localized distance line per
+        cooldown, otherwise protocol-only silence. No companion LLM call,
+        no bids, no history writes. History is never wiped. Work mode
+        bypasses the relationship soft block (prepared for milestone 0.5.0).
+        """
+        if not (self.owner_profile.available and self.config.OWNER_SOFT_BLOCK_ENABLED):
+            return None
+        status = await self.owner_profile.soft_block_status(owner)
+        if not status.get("blocked"):
+            return None
+        line = self.owner_profile.soft_block_line(self.static_lines, language)
+        can_speak = bool(line)
+        profile = await self.owner_profile.get(owner)
+        if profile is not None:
+            last_notice = float(profile.get("soft_block_last_notice_ts", 0) or 0)
+            if time.time() - last_notice < self.config.OWNER_SOFT_BLOCK_COOLDOWN_SECONDS:
+                can_speak = False
+        done: dict[str, Any] = {
+            "type": "done",
+            "id": hist.new_message_id(),
+            "mode": "companion",
+            "emotion": DEFAULT_EMOTION,
+            "ignored": True,
+            "reason": "soft_blocked",
+            "initiated_by": "user",
+        }
+        if can_speak and line:
+            done["text"] = line
+            done["segments"] = [{"text": line, "emotion": DEFAULT_EMOTION}]
+            await self.owner_profile.mark_soft_block_notice(owner)
+        if source_conn is not None:
+            await source_conn.send_json(done)
+        log.info("Companion turn suppressed by soft block")
+        return done
 
     async def run_companion_turn(
         self,
@@ -576,10 +702,25 @@ class Bridge:
                 await source_conn.send_json(frame)
             return frame
 
+        # Plan 12 step 5: owner-profile soft block, companion mode only.
+        soft_block = await self._maybe_soft_block(owner, language, source_conn)
+        if soft_block is not None:
+            return soft_block
+
         # Status frames go to the source connection only; status emotions
         # never become final reply emotions (plan section 10.4).
         if source_conn is not None:
             await source_conn.send_json(status_frame("thinking"))
+
+        # Plan 12 step 9: stamp owner activity (rhythm; metadata only).
+        if self.rhythm.available:
+            tz_name = (
+                source_conn.timezone if source_conn else ""
+            ) or self.config.OWNER_TIMEZONE
+            try:
+                await self.rhythm.stamp_contact(owner, tz_name)
+            except Exception:  # noqa: BLE001 - advisory hook never fails a turn
+                log.debug("rhythm stamp failed", exc_info=True)
 
         lock = self.connections.turn_lock(owner)
         delivered = False
@@ -587,6 +728,13 @@ class Bridge:
         assistant_row: dict = {}
         done: dict[str, Any]
         async with lock:
+            # Plan 12 step 8: bids owner-message hook (deterministic).
+            if self.bids.available:
+                try:
+                    await self.bids.satisfy_open_bids(owner, text)
+                except Exception:  # noqa: BLE001
+                    log.debug("bid satisfaction failed", exc_info=True)
+
             # Persist the user row BEFORE the provider call (plan 12.11).
             user_row = hist.make_row("user", text.strip(), hist.DELIVERED)
             await hist.append_row(
@@ -602,12 +750,64 @@ class Bridge:
                 self.config.LLM_HISTORY_MESSAGE_BUDGET,
                 exclude_id=user_row["id"],
             )
+
+            # Plan 12 steps 15-16: needs evaluation, state expression, and
+            # the owner lived profile block. First behavior turn materializes
+            # the profile record (plan 18.7).
+            state_block = ""
+            owner_block = ""
+            prompt_profile: dict | None = None
+            if self.needs.available:
+                snapshot = await self.needs.evaluate(owner)
+                if self.config.STATE_EXPRESSION_ENABLED:
+                    state_block = build_state_block(
+                        snapshot["zones"], self._read_identity("state")
+                    )
+            if self.owner_profile.available:
+                if (
+                    self.config.OWNER_BOUNDARY_PENALTIES_ENABLED
+                ):
+                    try:
+                        await self.owner_profile.record_boundary(owner, text, language)
+                    except Exception:  # noqa: BLE001
+                        log.debug("boundary classification failed", exc_info=True)
+                prompt_profile = await self.owner_profile.get(owner)
+                if prompt_profile is None:
+                    prompt_profile = await self.owner_profile.upsert(
+                        owner,
+                        default_profile(self.config),
+                        expected_version=1,
+                    ) or default_profile(self.config)
+                if self.config.OWNER_PROFILE_INJECT:
+                    blocked_now = bool(
+                        self.config.OWNER_SOFT_BLOCK_ENABLED
+                        and prompt_profile.get("soft_blocked")
+                    )
+                    owner_block = owner_relationship_block(
+                        prompt_profile, soft_blocked=blocked_now
+                    )
+
             messages = build_companion_prompt(
                 soul_text=self._read_identity("soul"),
                 profile_text=self._read_identity("profile"),
                 history=prompt_history,
                 current_text=text.strip(),
                 language=language,
+                state_block=state_block,
+                owner_block=owner_block,
+            )
+
+            wants_analysis = bool(
+                self.owner_profile.available and self.config.OWNER_PROFILE_LLM_ENABLED
+            )
+            exchange = (
+                {
+                    "user_text": text.strip(),
+                    "assistant_text": "",
+                    "language": language,
+                }
+                if wants_analysis
+                else None
             )
 
             try:
@@ -685,6 +885,21 @@ class Bridge:
                     self._chat_sync(assistant_row, "character", source_conn),
                     exclude=source_conn,
                 )
+                # Plan 12 step 29: needs/bid effects only after delivered
+                # assistant state.
+                if self.needs.available:
+                    try:
+                        await self.needs.turn_effects(
+                            owner, classify_turn_kind(text)
+                        )
+                    except Exception:  # noqa: BLE001
+                        log.debug("needs turn effects failed", exc_info=True)
+                # Status drift runs on delivered turns (flag-gated, 18.2).
+                if self.owner_profile.available:
+                    try:
+                        await self.owner_profile.apply_status_drift(owner)
+                    except Exception:  # noqa: BLE001
+                        log.debug("status drift failed", exc_info=True)
             else:
                 # Undelivered: excluded from future prompts, no fanout (12.28).
                 await hist.mark_delivery_state(
@@ -697,12 +912,70 @@ class Bridge:
                 delivered,
             )
 
+        # Plan 12 step 33: enqueue optional strict-JSON owner-profile
+        # analysis, only from delivered exchanges (flag-gated, background).
+        if delivered and exchange is not None and assistant_row:
+            exchange["assistant_text"] = reply_text
+            self._start_profile_analysis(owner, exchange, prompt_profile)
+
         # TTS runs outside the per-owner turn lock: it mutates no shared state
         # and streams only to the requesting connection (plan section 12
         # step 31). The done frame always precedes audio chunks (10.6).
         if wants_audio and delivered and source_conn is not None:
             await self._stream_tts(source_conn, assistant_row["id"], segments)
         return done
+
+    def _start_profile_analysis(
+        self, owner: str, exchange: dict, prompt_profile: dict | None
+    ) -> None:
+        async def _analyze() -> None:
+            try:
+                profile = prompt_profile
+                if profile is None:
+                    profile = await self.owner_profile.get(owner)
+                if profile is None:
+                    return
+                open_agreements = [
+                    agreement
+                    for agreement in profile.get("agreements", [])
+                    if agreement.get("status") == "active"
+                ] if self.config.OWNER_AGREEMENTS_ENABLED else []
+                messages = build_owner_profile_analysis_prompt(
+                    current_profile=profile,
+                    exchange=exchange,
+                    open_agreements=open_agreements,
+                )
+                result = await self.llm.chat("owner_profile", messages)
+                proposal = _parse_strict_json_object(result.text)
+                if proposal is None:
+                    log.info("Owner-profile analysis skipped: non-JSON proposal")
+                    return
+                async with self.connections.profile_lock(owner):
+                    current = await self.owner_profile.get(owner)
+                    if current is None:
+                        return
+                    updated, reject = validate_and_apply_proposal(
+                        current,
+                        proposal,
+                        max_delta=OWNER_PROPOSAL_MAX_DELTA,
+                    )
+                    if reject is not None:
+                        log.info("Owner-profile proposal rejected: %s", reject)
+                        return
+                    saved = await self.owner_profile.upsert(
+                        owner, updated, int(current.get("version", 1))
+                    )
+                if saved is not None:
+                    log.info(
+                        "Owner-profile proposal applied (%s)",
+                        saved.get("status", "unknown"),
+                    )
+            except Exception:  # noqa: BLE001 - analysis must never break turns
+                log.warning("Owner-profile analysis failed", exc_info=True)
+
+        task = asyncio.create_task(_analyze())
+        self.background_tasks.add(task)
+        task.add_done_callback(self.background_tasks.discard)
 
     # -- TTS chunk stream (plan sections 10.6, 13.4) -----------------------------
 

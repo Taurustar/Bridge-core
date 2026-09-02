@@ -60,6 +60,13 @@ class RedisCache:
     async def row_count(self, key: str) -> int:
         return int(await self._client.llen(key))
 
+    async def set_value(self, key: str, value: str) -> None:
+        """Store one JSON document (needs/bids/rhythm/profile state)."""
+        await self._client.set(key, value)
+
+    async def get_value(self, key: str) -> str | None:
+        return await self._client.get(key)
+
     async def delete(self, key: str) -> None:
         await self._client.delete(key)
 

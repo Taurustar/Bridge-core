@@ -51,6 +51,7 @@ class ConnectionManager:
         self._connections: dict[str, Connection] = {}
         self._by_user: dict[str, set[str]] = {}
         self._turn_locks: dict[str, asyncio.Lock] = {}
+        self._profile_locks: dict[str, asyncio.Lock] = {}
         self._pending: dict[str, asyncio.Future] = {}
 
     def connect(
@@ -108,6 +109,15 @@ class ConnectionManager:
         if lock is None:
             lock = asyncio.Lock()
             self._turn_locks[user_id] = lock
+        return lock
+
+    def profile_lock(self, user_id: str) -> asyncio.Lock:
+        """Per-owner profile lock for read-modify-write serialization
+        (plan section 18.7); separate from the companion turn lock."""
+        lock = self._profile_locks.get(user_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._profile_locks[user_id] = lock
         return lock
 
     async def fan_out(

@@ -19,7 +19,7 @@ from dataclasses import dataclass, field, fields
 
 from dotenv import dotenv_values
 
-from .constants import SUPPORTED_LANGUAGES
+from .constants import OWNER_RELATIONSHIP_STATUSES, SUPPORTED_LANGUAGES
 
 STRUCTURAL_FIELDS: frozenset[str] = frozenset(
     {
@@ -225,6 +225,11 @@ class Config:
     OWNER_DESIRABILITY_START: int = 50
     OWNER_BOUNDARY_PENALTIES_ENABLED: bool = False
     OWNER_SOFT_BLOCK_ENABLED: bool = False
+    OWNER_SOFT_BLOCK_COOLDOWN_SECONDS: int = 3600
+    OWNER_SOFT_BLOCK_UNBLOCK_TRUST_FLOOR: int = 25
+    OWNER_BOUNDARY_PENALTY_MINOR: float = 3.0
+    OWNER_BOUNDARY_PENALTY_MODERATE: float = 6.0
+    OWNER_BOUNDARY_PENALTY_MAJOR: float = 12.0
     OWNER_STATUS_DRIFT_ENABLED: bool = False
     OWNER_AGREEMENTS_ENABLED: bool = False
     OWNER_AGREEMENT_AFTERMATH_ENABLED: bool = False
@@ -378,6 +383,30 @@ class Config:
         unknown = [
             name for name in parse_chain(self.LLM_CHAIN) if name not in _KNOWN_PROVIDERS
         ]
+        if unknown:
+            raise ConfigError(
+                f"LLM_CHAIN contains unknown providers: {', '.join(unknown)}"
+            )
+        self.OWNER_STATUS_START = self.OWNER_STATUS_START.strip().lower()
+        if self.OWNER_STATUS_START not in OWNER_RELATIONSHIP_STATUSES:
+            raise ConfigError(
+                f"OWNER_STATUS_START must be one of "
+                f"{', '.join(OWNER_RELATIONSHIP_STATUSES)} "
+                f"(got {self.OWNER_STATUS_START!r})"
+            )
+        for score_name in ("OWNER_TRUST_START", "OWNER_CLOSENESS_START",
+                           "OWNER_APPEAL_START", "OWNER_DESIRABILITY_START"):
+            if not (0 <= getattr(self, score_name) <= 100):
+                raise ConfigError(f"{score_name} must be between 0 and 100")
+        if self.OWNER_SOFT_BLOCK_COOLDOWN_SECONDS < 0:
+            raise ConfigError("OWNER_SOFT_BLOCK_COOLDOWN_SECONDS must be >= 0")
+        for penalty_name in ("OWNER_BOUNDARY_PENALTY_MINOR",
+                             "OWNER_BOUNDARY_PENALTY_MODERATE",
+                             "OWNER_BOUNDARY_PENALTY_MAJOR"):
+            if getattr(self, penalty_name) <= 0:
+                raise ConfigError(f"{penalty_name} must be positive")
+        if self.OWNER_SOFT_BLOCK_UNBLOCK_TRUST_FLOOR < 0:
+            raise ConfigError("OWNER_SOFT_BLOCK_UNBLOCK_TRUST_FLOOR must be >= 0")
         if unknown:
             raise ConfigError(
                 f"LLM_CHAIN contains unknown providers: {', '.join(unknown)}"

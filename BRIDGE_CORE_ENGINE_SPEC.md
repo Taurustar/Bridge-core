@@ -2,7 +2,8 @@
 
 Living implementation contract. It refines unspecified details of
 `BRIDGE_CORE_ENGINE_IMPLEMENTATION_PLAN.md`; it may not override locked
-decisions (plan section 2). Milestones implemented: **0.1.0**, **0.2.0**.
+decisions (plan section 2). Milestones implemented: **0.1.0**, **0.2.0**,
+**0.3.0**.
 
 ## Deviations from the plan
 
@@ -17,6 +18,11 @@ decisions (plan section 2). Milestones implemented: **0.1.0**, **0.2.0**.
   inside the package so they travel with installs: `core/emotions.json`
   (neutral manifest) and `core/static_lines.json` (schema-complete, empty
   values). `EMOTIONS_FILE` / `STATIC_LINES_FILE` override them.
+  Milestone 0.3.0 adds `core/needs.py`, `core/bids.py`, `core/rhythm.py`,
+  `core/state_expression.py`, `core/owner_profile.py`, and the
+  `core/routes/` package (`profiles.py`, `state.py` only so far); the needs
+  tuning template stays at the plan-layout path `schedule/needs.json`
+  (`NEEDS_PROFILE_FILE` overrides).
 - **Voice profile "repeat variations"**: plan 14.1 lists "repeat variations"
   among voice-profile fields. The ElevenLabs chat-completions-era TTS API used
   here has no such parameter, so it is not implemented; the profile schema
@@ -77,8 +83,20 @@ Resolution for the reply language, in order:
 3. `DEFAULT_LANGUAGE` (config-validated to en/es/ja at startup).
 
 The pinned language is enforced by a post-history system message with the
-final-reply critical rules (plan 12 step 19), and localizes STT-empty static
-lines. Owner-profile preferred language joins step 2 in milestone 0.3.0.
+final-reply critical rules (plan 12 step 19), and localizes STT-empty and
+soft-block static lines.
+
+Resolution for the reply language (plan 7.4 order, complete as of
+milestone 0.3.0):
+
+1. Explicit per-message `language` field (validated; invalid values are
+   terminal errors, not silent fallbacks).
+2. The owner lived profile's `preferred_language` (blank = no preference;
+   set via `PATCH /profiles/owner`).
+3. For audio turns, the frame's `stt_language` when it is one of en/es/ja
+   (clear inbound-language detection; other codes pass through to the STT
+   provider but do not pin the reply).
+4. `DEFAULT_LANGUAGE` (config-validated to en/es/ja at startup).
 
 ### Voice-input (audio) turns
 
@@ -109,11 +127,22 @@ lines. Owner-profile preferred language joins step 2 in milestone 0.3.0.
 - A non-empty transcript becomes a normal text companion turn; `wants_audio`
   passes through.
 
-### Companion turn (0.1.0 simplification of plan section 12)
+### Companion turn (plan section 12, as of 0.3.0)
+
+Implemented hooks, in lifecycle order: soft-block gate (step 5, companion
+only) → status(thinking) → rhythm stamp (step 9, flag-gated) → turn lock →
+bid satisfaction (step 8, flag-gated) → user row persist + fanout (step 11)
+→ needs evaluate + state-expression block (step 15) → owner-profile block
+injection (step 16, first turn materializes the record) → boundary
+classification (18.4, flag-gated) → prompt → LLM → segments → assistant row
+pending → done → delivered: mark + fanout + needs turn effects + status
+drift (steps 27-29) → background strict-JSON profile analysis (step 33,
+flag-gated, delivered exchanges only) → TTS stream (step 31, outside the
+lock).
 
 Skipped hooks (they do not exist yet; flags off, no keys, no tasks, no LLM
-calls): needs/bids/rhythm, schedule/availability, owner profile, memory
-retrieval/extraction, life mentions, catch-up.
+calls): schedule/availability (0.4.0), life mentions (0.4.0), memory
+retrieval/extraction (0.6.0), catch-up (0.4.0), initiative (0.7.0).
 
 - User rows persist with `delivery_state: "delivered"` (they were received
   from the owner device) **before** the provider call; `chat_sync` fanout
@@ -216,9 +245,130 @@ retrieval/extraction, life mentions, catch-up.
   are validation errors; extra languages are allowed but unused).
 - A blank value in the pinned language is deliberate silence — protocol-only
   metadata, **no cross-language fallback**.
-- 0.2.0 uses only `stt_empty` (empty and failed STT). `busy`/`unavailable`
-  arrive with schedule (0.4.0) and `soft_block` with the owner profile
-  (0.3.0).
+- 0.2.0 uses `stt_empty` (empty and failed STT); 0.3.0 adds `soft_block`.
+  `busy`/`unavailable` arrive with schedule (0.4.0).
+
+## Milestone 0.3.0 — needs, interaction, and owner profile
+
+### Redis keys (plan section 28, 0.3.0 scope)
+
+Beyond companion history, the following single-document keys may exist, each
+only while its feature flag is ON (flag-off creates none — covered by
+integration tests):
+
+- `core:needs:{owner}` — needs state (`values`, `last_eval_ts`,
+  `skipped_gap_count`, `activity`).
+- `core:bids:{owner}` — bounded bid record (≤ 64 entries, metadata only).
+- `core:rhythm:{owner}` — hourly owner-contact histogram (≤ 48 buckets) +
+  last-contact timestamps in owner civil time. Never message text.
+- `core:owner_profile:{owner}` — the lived-profile JSON document (plan 18.2
+  schema plus `preferred_language`, `proposals_applied`, `last_drift_ts`,
+  `proposals_at_last_drift` refinements).
+
+### Needs engine (plan section 15)
+
+- Tuning file: `schedule/needs.json` (bundled conservative defaults,
+  `NEEDS_PROFILE_FILE` override). Keys starting with `_` are ignored so the
+  template can carry authoring comments. Unknown stats, unknown turn-effect
+  kinds, and schema versions > 1 fail startup; `migrate_needs` is the
+  explicit per-version migration seam.
+- `evaluate` advances from UTC timestamps (DST cannot alter elapsed time),
+  bounds gaps at `NEEDS_MAX_ELAPSED_HOURS` (skipped gaps increment
+  `skipped_gap_count` and are never replayed), and persists. `peek` is the
+  read-only projection used by `GET /state`.
+- Zones: `fine|low|critical` (`higher_is_better` thresholds go below; 
+  `lower_is_better` thresholds go above), bond `secure|strained|deprived`.
+- `GET /state` requires `NEEDS_ENABLED` **and** `STATE_EXPRESSION_ENABLED`
+  (zones exist only through the needs engine); otherwise 403
+  `feature_disabled`. The route is a pure poll — it never writes.
+- State expression renders only `(stat, zone)` pairs that have a matching
+  `## stat:zone` section in the authored `STATE.md`; bond `fine` renders as
+  `secure`. No numeric values and no dialogue are ever emitted.
+- Needs turn effects apply only after the assistant row is delivered
+  (plan 12 step 29), classified deterministically: ≤ 240 chars =
+  `companion_brief`, else `companion_engaged`.
+
+### Bids and rhythm (plan sections 15.5, 15.6)
+
+- Bid registration happens only after confirmed initiative delivery, which
+  is milestone 0.7.0 — in 0.3.0 nothing opens bids, so the store stays empty
+  unless initiative lands. Store, deterministic satisfaction (replies of at
+  least 8 characters answer every open bid; no LLM), bounded record, and the
+  expiry sweep (at most once per minute, from heartbeat maintenance) exist
+  now behind `BIDS_ENABLED`.
+- Rhythm stamps one owner-contact histogram bucket per turn start using the
+  source connection's timezone (falling back to `OWNER_TIMEZONE`) behind
+  `RHYTHM_ENABLED`. It never reads telemetry and never stores text.
+
+### Owner lived profile (plan section 18)
+
+- **Store**: one JSON document at `core:owner_profile:{owner}`. GET returns
+  `{"profile": <default projection>, "materialized": false}` when the store
+  is missing — it never materializes (plan 6.4). The first behavior turn or
+  an explicit PATCH creates the record. All read-modify-write paths
+  (PATCH, background proposals) serialize under a per-owner **profile lock**
+  (separate from the turn lock) and go through a version-checked upsert;
+  a version mismatch returns HTTP 409 `version_conflict`.
+- **PATCH /profiles/owner** requires the `X-Confirm-Token:
+  UPDATE_OWNER_PROFILE` mistake-guard header (plan 18.7; the token is a
+  human-factors guard, not a secret and not authentication). Valid fields:
+  trust/closeness/appeal/desirability (clamped 0-100), `tone_with_owner`,
+  `preferred_language` (blank or en/es/ja), `persona_summary` (≤ 400),
+  `likes`/`prefs` (≤ 16 items × 120 chars), `status` (plan 18.2 list;
+  change stamps `status_reason: "admin_patch"`), and `soft_blocked`
+  (setting it true opens a fresh cooldown window; clearing it lifts
+  immediately). Unknown/invalid fields → 400 `invalid_patch`. Feature-off →
+  403 `feature_disabled`.
+- **Boundary penalties** (`OWNER_BOUNDARY_PENALTIES_ENABLED`): deterministic
+  EN/ES/JA pattern classifiers for the five plan-18.4 categories (marker-
+  based language detection, unknown text falls back to the frame language).
+  Severity: 1 pattern hit = moderate (hard-boundary disregard = major),
+  2+ hits = major. Each hit stores `{category, severity, ts, penalty, mode}`
+  — never message text — and applies its configured trust penalty
+  (`OWNER_BOUNDARY_PENALTY_{MINOR,MODERATE,MAJOR}`). Events are capped at
+  the `needs.json` `owner_profile.max_boundary_events` (default 50).
+- **Soft block** (`OWNER_SOFT_BLOCK_ENABLED`): engages on any major hit or
+  when trust drops under `needs.json`
+  `owner_profile.soft_block_trust_threshold` (default 20). While blocked,
+  companion turns return a terminal `done` with `ignored: true`,
+  `reason: "soft_blocked"` **before** the turn lock: no LLM call, no bids,
+  no history writes, no needs effects; history is never wiped. The authored
+  `soft_block` static line is spoken at most once per
+  `OWNER_SOFT_BLOCK_COOLDOWN_SECONDS`, otherwise the done is protocol-only.
+  Auto-lift requires the cooldown to have passed **and** trust above
+  `OWNER_SOFT_BLOCK_UNBLOCK_TRUST_FLOOR`; otherwise the window extends.
+  `PATCH {"soft_blocked": false}` lifts immediately (admin action). Work
+  mode bypasses the relationship soft block by design (plan 12 step 5);
+  work itself ships in 0.5.0.
+- **Agreements** (`OWNER_AGREEMENTS_ENABLED`): validated against the plan
+  18.5 shape; ≤ 12 active (`agreement_max_active` in `needs.json`);
+  `personality_tension` agreements require trust ≥ 50 and closeness ≥ 40
+  (floors in `needs.json`); schedules are reminder windows only.
+- **Strict-JSON proposals** (`OWNER_PROFILE_LLM_ENABLED`): after each
+  **delivered** companion turn the bridge enqueues a background
+  `owner_profile`-mode analysis (plan 12 step 33). The reply must parse as a
+  single JSON object (markdown fences tolerated, prose rejected); everything
+  is clamped: summary ≤ 400 chars, list items ≤ 120×16, appeal/desirability
+  deltas ±3, status suggestions must be adjacent steps in the plan-18.2
+  order (treated as an intimacy axis: partner→estranged), agreement adds
+  pass the same cap/floor validation, and `personality_tension` floors are
+  evaluated against the live record. Rejected proposals are logged as one
+  bounded line; raw exchanges and raw proposals are never stored. The store
+  only ever sees validated fields plus a `proposals_applied` counter.
+- **Status drift** (`OWNER_STATUS_DRIFT_ENABLED`): evaluated on delivered
+  turns; score = −(1 minor / 2 moderate / 4 major boundary events since the
+  last drift) + (+1 per applied proposal since then). |score| ≥ 5 moves the
+  status exactly one adjacent step (negative → toward `estranged`, positive
+  → toward `partner`), stamps `status_reason: "status_drift"`, and resets
+  the evidence windows. At the axis ends there is no further drift.
+- **Agreement aftermath** (`OWNER_AGREEMENT_AFTERMATH_ENABLED`): when a soft
+  block engages, every `active` agreement becomes `suspended_by_block` and
+  `agreement_aftermath` records the count; when the block lifts (auto or
+  admin), suspended agreements return to `active` and the aftermath records
+  the restoration.
+- **Preferred language**: the profile's `preferred_language` (plan 7.4
+  step 2) joins the reply-language fallback between the explicit pin and
+  inbound-language detection (see the language-pin section above).
 
 ### LLM router
 
@@ -252,12 +402,26 @@ retrieval/extraction, life mentions, catch-up.
   and startup pings it.
 - `/status` exposes version, Redis health, provider configured booleans and
   URLs (never credentials), a `speech` section (TTS/STT enabled, provider,
-  configured, voice-profile-loaded, output format), feature flags, identity
-  file paths/mtimes (never contents), companion routes, deployment mode, and
-  connection count.
+  configured, voice-profile-loaded, output format), `needs` and
+  `owner_profile` sections (enabled/inject/flags — never scores), feature
+  flags, identity file paths/mtimes (never contents), companion routes,
+  deployment mode, and connection count.
 - `/emotions` serves the validated manifest. An invalid/missing manifest
   fails startup; the manifest may not introduce names outside the
   `constants.py` palette.
+- `GET /state` (0.3.0): read-only needs peek — zones, values, shutdown flag,
+  and the rendered `[CHARACTER STATE]` block. Requires
+  `NEEDS_ENABLED` + `STATE_EXPRESSION_ENABLED`, else 403 `feature_disabled`.
+  Never writes (plan 6.4).
+- `GET /profiles/owner` (0.3.0): the stored profile or a default projection
+  with `"materialized": false`; includes the effective soft-block status.
+  Never materializes the store.
+- `PATCH /profiles/owner` (0.3.0): mistake-guard token required (see the
+  0.3.0 section). Validation failures → 400, feature-off → 403, concurrent
+  version mismatch → 409 `version_conflict`.
+- `POST /message` (0.3.0): the owner-profile preferred language joins the
+  language fallback, and a soft-blocked turn returns 200 with the
+  done-shaped body (`ignored: true`, `reason: "soft_blocked"`).
 
 ### Tailscale validation
 
@@ -273,28 +437,34 @@ retrieval/extraction, life mentions, catch-up.
 
 - `tests/fakes.py::FakeRedis` implements the exact async subset
   `core.cache.RedisCache` uses (`ping`, transactional `pipeline` with
-  `rpush`/`ltrim`/`execute`, `lrange`, `lset`, `llen`, `delete`, `keys`,
-  `aclose`) against an in-memory `dict[str, list[str]]`, preserving the store
-  contract without a live server.
+  `rpush`/`ltrim`/`execute`, `lrange`, `lset`, `llen`, `set`/`get` for
+  single documents, `delete`, `keys`, `aclose`) against in-memory list and
+  string stores, preserving the store contract without a live server.
 - `tests/fakes.py::FakeLLM` is a scriptable router substitute (queued replies,
   exceptions, or callables; optional blocking gate).
 - `tests/fakes.py::FakeSTT` / `FakeTTS` are scriptable speech-service
   substitutes (queued transcripts, forced provider errors, per-chunk-text TTS
   failures, availability toggles) so WS integration tests need no network.
+- `tests/fakes.py::FakeNeeds` / `FakeOwnerProfile` are scriptable engine
+  substitutes for the bridge-facing 0.3.0 surfaces; the enabled-profile
+  integration tests exercise the real engines over `FakeRedis`.
 - Speech-service unit tests use `httpx.MockTransport` responders that record
   requests and replay scripted responses.
 - HTTP+WS tests use FastAPI's `TestClient`; no network, no live Redis.
 
-## Redis keys in 0.1.0–0.2.0
+## Redis keys in 0.1.0–0.3.0
 
-Exactly one key family may exist: `core:history:{owner}:companion` (list of
-JSON rows: `id`, `role`, `text`, `emotion`, `ts`, `delivery_state`). The
-flags-off test asserts no other keys are created by a turn. **Audio is never
-stored server-side** — audio bytes exist only in flight, and the STT/TTS
-paths write no keys. All other keys in plan section 28 belong to later
-milestones.
+`core:history:{owner}:companion` (list of JSON rows: `id`, `role`, `text`,
+`emotion`, `ts`, `delivery_state`) is the only key a flags-off deployment
+ever creates — the flag-off parity tests assert no other keys after turns
+and polls. With 0.3.0 flags enabled, the single-document keys
+`core:needs:{owner}`, `core:bids:{owner}`, `core:rhythm:{owner}`, and
+`core:owner_profile:{owner}` may appear (see the milestone 0.3.0 section).
+**Audio is never stored server-side** — audio bytes exist only in flight,
+and the STT/TTS paths write no keys. All other keys in plan section 28
+belong to later milestones.
 
 ## Version source
 
-`core/constants.py::VERSION = "0.2.0"` is the single source; the entrypoint
+`core/constants.py::VERSION = "0.3.0"` is the single source; the entrypoint
 docstring, README, `connected` frame, and `/status` derive from it.

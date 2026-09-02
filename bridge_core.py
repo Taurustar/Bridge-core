@@ -1,4 +1,4 @@
-"""Bridge Core Engine 0.2.0 — entrypoint.
+"""Bridge Core Engine — entrypoint.
 
 A self-hosted backend for a persistent character companion. Single-owner,
 Tailscale-only, no application auth (plan sections 2, 27).
