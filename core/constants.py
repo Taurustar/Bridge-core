@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 
 # ---------------------------------------------------------------------------
 # Emotion palette (plan section 13.1). The v1 palette is fixed for wire
@@ -52,6 +52,9 @@ STATUS_TO_EMOTION: dict[str, str] = {
 
 DEFAULT_EMOTION = "neutral"
 
+# Supported reply languages (plan section 7.4).
+SUPPORTED_LANGUAGES: tuple[str, ...] = ("en", "es", "ja")
+
 # LLM modes known to the router (plan section 8.2).
 LLM_MODES: tuple[str, ...] = (
     "companion",
@@ -75,12 +78,13 @@ HEARTBEAT_MAX_AGE_SECONDS = 600
 INITIATIVE_COUNTER_STUB = 0
 
 # ---------------------------------------------------------------------------
-# Redis keys (plan section 28). Milestone 0.1.0 may create exactly one key
-# family: companion history. Everything else belongs to later milestones and
+# Redis keys (plan section 28). Milestones 0.1.0-0.2.0 may create exactly one
+# key family: companion history. Speech is never persisted server-side; audio
+# bytes exist only in flight. Everything else belongs to later milestones and
 # must not be written while their feature flags are off.
 # ---------------------------------------------------------------------------
 
 
 def companion_history_key(owner_user_id: str) -> str:
-    """The only Redis key milestone 0.1.0 creates."""
+    """The only Redis key milestones 0.1.0-0.2.0 create."""
     return f"core:history:{owner_user_id}:companion"

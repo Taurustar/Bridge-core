@@ -1,11 +1,11 @@
 # Bridge Core Engine
 
 <p align="center">
-  <img src="assets/akane-beyond-chat.png" alt="Akane — Beyond Chat" width="700"/>
+  <img src="assets/bridge-core-engine-banner.png" alt="Bridge Core Engine" width="700"/>
 </p>
 
 <p align="center">
-  <strong>Version 0.1.0</strong> — Self-hosted backend for a persistent character companion.<br>
+  <strong>Version 0.2.0</strong> — Self-hosted backend for a persistent character companion.<br>
   <em>Lightweight. General-purpose. Privacy-first.</em>
 </p>
 
@@ -181,21 +181,24 @@ defaults. Real environment variables override file values. Invalid numeric or
 boolean values fail startup with a clear message. Secrets are never exposed
 via `/status` or logs.
 
-## Repository layout (milestone 0.1.0)
+## Repository layout (milestone 0.2.0)
 
 ```text
 bridge_core.py            entrypoint
 core/
   app.py                  FastAPI app, lifespan, HTTP/WS routes
-  bridge.py               wiring + companion turn lifecycle + heartbeat
+  bridge.py               wiring + companion turn lifecycle + heartbeat + TTS stream
   config.py               Config dataclass, core.env loader, hot reload
   constants.py            VERSION, emotion palette, Redis key helpers
   cache.py                async Redis wrapper (required service)
   connections.py          multi-device ConnectionManager, per-owner turn lock
   llm.py                  provider router with failover
+  speech.py               ElevenLabs TTS, Deepgram/AssemblyAI STT, audio validation
+  static_lines.py         owner-authored no-LLM speech lines (blank = silence)
+  static_lines.json       bundled schema-complete empty line tables
   history.py              companion history rows and delivery states
   prompts.py              companion prompt builder (structural laws)
-  text_utils.py           emotion tag parsing, asterisk stripping
+  text_utils.py           emotion segment parsing, scrubbers, TTS chunking
   tailscale.py            bind validation (section 27.2)
   emotions.py             manifest loading/validation
   emotions.json           bundled neutral emotion manifest
@@ -210,13 +213,18 @@ tests/                    unittest suite (no live services required)
 
 Milestone 0.1.0 scope: core transport (HTTP + WebSocket), text-only companion turns, multi-device `chat_sync`, heartbeats, the Fireworks/Chutes/Ollama/OpenAI-compatible LLM router, history persistence, and the health/status/emotions endpoints.
 
+Milestone 0.2.0 scope (current): the speech and emotion pipeline — ElevenLabs TTS with sequential pipelined audio chunks (`done` always precedes chunks), Deepgram and AssemblyAI STT with strict audio payload validation, per-segment emotion parsing with control-tag/reasoning scrubbing, thinking status frames, the emotion-only retry, per-message language pins (en/es/ja), and owner-authored static lines (blank = protocol-only silence) for empty/failed STT. Audio is never stored server-side.
+
 Planned (behind flags that default OFF):
-- Speech (TTS / STT)
 - Needs & emotional simulation
 - Schedule & availability
 - Work mode (agentic tool use)
 - Long-term memory
 - Initiative & proactive reach-out
+
+Speech flags (`TTS_ENABLED`, `STT_ENABLED`) default OFF; when off, the
+`connected` capabilities omit `audio`/`voice_input` and audio frames return a
+terminal `stt_unavailable` error.
 
 ## License
 

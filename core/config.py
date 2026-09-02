@@ -19,6 +19,8 @@ from dataclasses import dataclass, field, fields
 
 from dotenv import dotenv_values
 
+from .constants import SUPPORTED_LANGUAGES
+
 STRUCTURAL_FIELDS: frozenset[str] = frozenset(
     {
         "BRIDGE_HOST",
@@ -361,6 +363,18 @@ class Config:
             raise ConfigError("LLM_CHAIN_DEADLINE_SECONDS must be positive")
         if self.MAX_HISTORY_TURNS < 1:
             raise ConfigError("MAX_HISTORY_TURNS must be at least 1")
+        self.DEFAULT_LANGUAGE = self.DEFAULT_LANGUAGE.strip().lower()
+        if self.DEFAULT_LANGUAGE not in SUPPORTED_LANGUAGES:
+            raise ConfigError(
+                f"DEFAULT_LANGUAGE must be one of {', '.join(SUPPORTED_LANGUAGES)} "
+                f"(got {self.DEFAULT_LANGUAGE!r})"
+            )
+        self.STT_PROVIDER = self.STT_PROVIDER.strip().lower()
+        if self.STT_PROVIDER not in ("deepgram", "assemblyai"):
+            raise ConfigError(
+                f"STT_PROVIDER must be deepgram or assemblyai "
+                f"(got {self.STT_PROVIDER!r})"
+            )
         unknown = [
             name for name in parse_chain(self.LLM_CHAIN) if name not in _KNOWN_PROVIDERS
         ]

@@ -21,8 +21,9 @@ from .bridge import Bridge
 from .cache import RedisCache
 from .config import Config
 from .connections import ConnectionManager
-from .constants import VERSION
+from .constants import SUPPORTED_LANGUAGES, VERSION
 from .llm import LLMRouter
+from .speech import STTService, TTSService
 from .tailscale import validate_bind
 
 log = logging.getLogger("bridge.app")
@@ -37,6 +38,8 @@ def create_app(
     *,
     cache: RedisCache | None = None,
     llm: LLMRouter | None = None,
+    stt: STTService | None = None,
+    tts: TTSService | None = None,
     tailscale_addresses: set[str] | None = None,
 ) -> FastAPI:
     config = config or Config.from_env()
@@ -48,7 +51,9 @@ def create_app(
 
     if cache is None:
         cache = RedisCache.connect(config.REDIS_HOST, config.REDIS_PORT, config.REDIS_DB)
-    bridge = Bridge(config, cache, llm=llm, connections=ConnectionManager())
+    bridge = Bridge(
+        config, cache, llm=llm, connections=ConnectionManager(), stt=stt, tts=tts
+    )
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -128,6 +133,20 @@ def create_app(
                 {"provider": r.provider, "model": r.model or None}
                 for r in bridge.llm.routes_for("companion")
             ],
+            "speech": {
+                "tts": {
+                    "enabled": cfg.TTS_ENABLED,
+                    "provider": "elevenlabs",
+                    "configured": bridge.tts.available(),
+                    "voice_profile_loaded": bridge.tts.has_voice_profile,
+                    "output_format": cfg.TTS_OUTPUT_FORMAT,
+                },
+                "stt": {
+                    "enabled": cfg.STT_ENABLED,
+                    "provider": cfg.STT_PROVIDER,
+                    "configured": bridge.stt.available(),
+                },
+            },
             "features": bridge.feature_summary(),
             "identity_files": bridge.identity_info(),
             "emotions_manifest_version": bridge.emotions_manifest.get("version"),
@@ -184,7 +203,20 @@ def create_app(
                 status_code=400,
                 content=error_body("empty_input", "Message text must not be empty."),
             )
-        language = body.get("language") or bridge.config.DEFAULT_LANGUAGE
+        language = body.get("language")
+        if language is not None and language != "":
+            if not isinstance(language, str) or language.strip().lower() not in SUPPORTED_LANGUAGES:
+                return JSONResponse(
+                    status_code=400,
+                    content=error_body(
+                        "unsupported_language",
+                        f"Unsupported reply language: {language!r}. "
+                        f"Supported: {', '.join(SUPPORTED_LANGUAGES)}.",
+                    ),
+                )
+            language = language.strip().lower()
+        else:
+            language = bridge.config.DEFAULT_LANGUAGE
         done = await bridge.run_companion_turn(
             text=text, language=language, source_conn=None
         )

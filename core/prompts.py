@@ -33,7 +33,9 @@ def build_companion_prompt(
     """Build the chat-completions message list for a companion turn.
 
     Identity authority order (plan section 6.3): SOUL.md, then PROFILE.md,
-    then structural laws, then live history, then the current user input last.
+    then structural laws, then live history, then post-history critical rules
+    with the per-turn language lock, then the current user input last
+    (plan section 12 steps 17-19).
     """
     system_parts: list[str] = []
     if soul_text.strip():
@@ -41,7 +43,6 @@ def build_companion_prompt(
     if profile_text.strip():
         system_parts.append(profile_text.strip())
     system_parts.append(STRUCTURAL_LAWS.strip())
-    system_parts.append(f"Reply in language: {language}.")
 
     messages: list[dict] = [{"role": "system", "content": "\n\n".join(system_parts)}]
     for row in history:
@@ -49,5 +50,16 @@ def build_companion_prompt(
         if role not in ("user", "assistant"):
             continue
         messages.append({"role": role, "content": str(row.get("text", ""))})
+    messages.append(
+        {
+            "role": "system",
+            "content": (
+                "[FINAL REMINDER]\n"
+                "- Begin your final reply with [EMOTION: name] on its own line, "
+                "then the spoken text.\n"
+                f"- Reply in language: {language}."
+            ),
+        }
+    )
     messages.append({"role": "user", "content": current_text})
     return messages

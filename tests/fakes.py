@@ -17,6 +17,7 @@ from typing import Any
 from core.cache import RedisCache
 from core.config import Config
 from core.llm import LLMChainExhausted, LLMResult
+from core.speech import TTSError
 
 
 class FakePipeline:
@@ -129,6 +130,86 @@ class FakeLLM:
 
     def routes_for(self, mode: str) -> list:
         return []
+
+    async def aclose(self) -> None:
+        pass
+
+
+class FakeSTT:
+    """Scriptable STT service substitute.
+
+    ``transcripts`` is a queue of transcripts returned in order (missing ->
+    ""). ``error`` raises before consuming a transcript, simulating provider
+    failure. ``available_flag`` toggles the availability answer.
+    """
+
+    provider_name = "fake"
+
+    def __init__(
+        self,
+        transcripts: list[str] | None = None,
+        error: Exception | None = None,
+        available_flag: bool = True,
+    ) -> None:
+        self._transcripts: deque = deque(transcripts or [])
+        self._error = error
+        self.available_flag = available_flag
+        self.calls: list[tuple[bytes, str, str]] = []
+
+    def available(self) -> bool:
+        return self.available_flag
+
+    async def transcribe(self, audio: bytes, content_type: str, language: str) -> str:
+        self.calls.append((audio, content_type, language))
+        if self._error is not None:
+            raise self._error
+        if self._transcripts:
+            return self._transcripts.popleft()
+        return ""
+
+    async def aclose(self) -> None:
+        pass
+
+
+class FakeTTS:
+    """Scriptable TTS service substitute.
+
+    Synthesis returns deterministic bytes per chunk; ``fail_texts`` makes the
+    matching chunk texts raise ``TTSError`` so tests can prove failed TTS
+    never removes the text reply.
+    """
+
+    def __init__(
+        self,
+        fail_texts: frozenset[str] | set[str] = frozenset(),
+        available_flag: bool = True,
+    ) -> None:
+        self.fail_texts = set(fail_texts)
+        self.available_flag = available_flag
+        self.calls: list[tuple[str, str]] = []
+
+    def available(self) -> bool:
+        return self.available_flag
+
+    @property
+    def audio_format(self) -> str:
+        return "mp3"
+
+    def attach_manifest(self, manifest: dict) -> None:
+        pass
+
+    def set_voice_profile(self, profile: dict) -> None:
+        pass
+
+    @property
+    def has_voice_profile(self) -> bool:
+        return False
+
+    async def synthesize(self, text: str, emotion: str) -> bytes:
+        self.calls.append((text, emotion))
+        if text in self.fail_texts:
+            raise TTSError(f"fake tts failure for chunk {text!r}")
+        return f"audio:{emotion}:{text}".encode("utf-8")
 
     async def aclose(self) -> None:
         pass

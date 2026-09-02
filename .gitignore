@@ -3,3 +3,4 @@ __pycache__/
 core.env
 data/
 *.pyc
+.DS_Store
