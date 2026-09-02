@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "emotions": [
+    {"name": "neutral", "tts_speed": 1.0, "sprite_key": "neutral", "animation_key": "neutral_idle"},
+    {"name": "happy", "tts_speed": 1.0, "sprite_key": "happy", "animation_key": "happy_idle"},
+    {"name": "sad", "tts_speed": 1.0, "sprite_key": "sad", "animation_key": "sad_idle"},
+    {"name": "angry", "tts_speed": 1.0, "sprite_key": "angry", "animation_key": "angry_idle"},
+    {"name": "annoyed", "tts_speed": 1.0, "sprite_key": "annoyed", "animation_key": "annoyed_idle"},
+    {"name": "embarrassed", "tts_speed": 1.0, "sprite_key": "embarrassed", "animation_key": "embarrassed_idle"},
+    {"name": "surprised", "tts_speed": 1.0, "sprite_key": "surprised", "animation_key": "surprised_idle"},
+    {"name": "confused", "tts_speed": 1.0, "sprite_key": "confused", "animation_key": "confused_idle"},
+    {"name": "worried", "tts_speed": 1.0, "sprite_key": "worried", "animation_key": "worried_idle"},
+    {"name": "scared", "tts_speed": 1.0, "sprite_key": "scared", "animation_key": "scared_idle"},
+    {"name": "tired", "tts_speed": 1.0, "sprite_key": "tired", "animation_key": "tired_idle"},
+    {"name": "sleepy", "tts_speed": 1.0, "sprite_key": "sleepy", "animation_key": "sleepy_idle"},
+    {"name": "excited", "tts_speed": 1.0, "sprite_key": "excited", "animation_key": "excited_idle"},
+    {"name": "playful", "tts_speed": 1.0, "sprite_key": "playful", "animation_key": "playful_idle"},
+    {"name": "affectionate", "tts_speed": 1.0, "sprite_key": "affectionate", "animation_key": "affectionate_idle"},
+    {"name": "confident", "tts_speed": 1.0, "sprite_key": "confident", "animation_key": "confident_idle"},
+    {"name": "serious", "tts_speed": 1.0, "sprite_key": "serious", "animation_key": "serious_idle"},
+    {"name": "shy", "tts_speed": 1.0, "sprite_key": "shy", "animation_key": "shy_idle"}
+  ],
+  "status_emotions": ["thinking", "working", "question", "request_permission"]
+}
