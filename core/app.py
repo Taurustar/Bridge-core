@@ -163,6 +163,30 @@ def create_app(
                 "llm_analysis": cfg.OWNER_PROFILE_LLM_ENABLED,
                 "agreements": cfg.OWNER_AGREEMENTS_ENABLED,
             },
+            "schedule": {
+                "enabled": bridge.schedule is not None and bridge.schedule.available,
+                "timezone": cfg.CHARACTER_TIMEZONE,
+                "dir": cfg.SCHEDULE_DIR or None,
+                "now": (
+                    bridge.schedule.peek()["now"]
+                    if bridge.schedule is not None and bridge.schedule.available
+                    else None
+                ),
+                "soft_busy_policy": cfg.SCHEDULE_SOFT_BUSY_POLICY,
+            },
+            "life": {
+                "enabled": bridge.life is not None and bridge.life.available,
+                "events_dir": cfg.LIFE_EVENTS_DIR or None,
+                "templates_enabled": (
+                    len(bridge.life.templates) if bridge.life is not None else 0
+                ),
+                "daily_min": cfg.LIFE_DAILY_MIN,
+                "daily_max": cfg.LIFE_DAILY_MAX,
+                "longterm_backend": "redis_fallback",
+            },
+            "user_schedule": {
+                "enabled": bridge.user_schedule.available,
+            },
             "connections": len(bridge.connections.connections_for(cfg.OWNER_USER_ID)),
         }
 
@@ -170,11 +194,17 @@ def create_app(
     async def emotions():
         return bridge.emotions_manifest
 
+    from .routes.life import register_life_routes
     from .routes.profiles import register_profile_routes
+    from .routes.schedule import register_schedule_routes
     from .routes.state import register_state_routes
+    from .routes.user_schedule import register_user_schedule_routes
 
     register_profile_routes(app, bridge)
     register_state_routes(app, bridge)
+    register_schedule_routes(app, bridge)
+    register_life_routes(app, bridge)
+    register_user_schedule_routes(app, bridge)
 
     @app.post("/message")
     async def message(request: Request):

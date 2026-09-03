@@ -76,20 +76,31 @@ async def load_rows(cache: RedisCache, owner: str) -> list[dict]:
     return rows
 
 
-def delivered_rows(rows: list[dict], exclude_id: str | None = None) -> list[dict]:
+def delivered_rows(
+    rows: list[dict], exclude_id: str | None = None, exclude_ids: set[str] | None = None
+) -> list[dict]:
     """Only delivered rows may enter prompts (plan section 12 steps 12, 28)."""
+    excluded = exclude_ids or set()
     return [
         row
         for row in rows
-        if row.get("delivery_state") == DELIVERED and row.get("id") != exclude_id
+        if row.get("delivery_state") == DELIVERED
+        and row.get("id") != exclude_id
+        and row.get("id") not in excluded
     ]
 
 
 async def load_prompt_history(
-    cache: RedisCache, owner: str, budget: int, exclude_id: str | None = None
+    cache: RedisCache,
+    owner: str,
+    budget: int,
+    exclude_id: str | None = None,
+    exclude_ids: set[str] | None = None,
 ) -> list[dict]:
     """Bounded prior delivered history for the prompt."""
-    rows = delivered_rows(await load_rows(cache, owner), exclude_id=exclude_id)
+    rows = delivered_rows(
+        await load_rows(cache, owner), exclude_id=exclude_id, exclude_ids=exclude_ids
+    )
     return rows[-budget:] if budget > 0 else []
 
 

@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  <strong>Version 0.3.0</strong> — Self-hosted backend for a persistent character companion.<br>
+  <strong>Version 0.4.0</strong> — Self-hosted backend for a persistent character companion.<br>
   <em>Lightweight. General-purpose. Privacy-first.</em>
 </p>
 
@@ -187,7 +187,7 @@ profile floors) lives in `schedule/needs.json` — the bundled values are
 engine-safe neutrals, not character calibration; tune them for your
 deployment.
 
-## Repository layout (milestone 0.3.0)
+## Repository layout (milestone 0.4.0)
 
 ```text
 bridge_core.py            entrypoint
@@ -203,7 +203,7 @@ core/
   static_lines.py         owner-authored no-LLM speech lines (blank = silence)
   static_lines.json       bundled schema-complete empty line tables
   history.py              companion history rows and delivery states
-  prompts.py              companion + owner-profile analysis prompt builders
+  prompts.py              companion/catch-up/life/analysis prompt builders
   text_utils.py           emotion segment parsing, scrubbers, TTS chunking
   tailscale.py            bind validation (section 27.2)
   emotions.py             manifest loading/validation
@@ -214,10 +214,20 @@ core/
   state_expression.py     [CHARACTER STATE] block from STATE.md zones
   owner_profile.py        owner lived profile: boundaries, soft block, agreements,
                           strict-JSON proposals, status drift
+  schedule.py             real-time character day schedule (DST-safe, hot reload)
+  interaction.py          bounded deferred queue + busy-ladder counters
+  life.py                 block-entry character life events + pending mentions
+  memory.py               durable Redis long-term fallback (core:longterm:{owner})
+  context_feed.py         awareness block + bounded context feed (PAST/PENDING)
+  user_schedule.py        contextual owner schedule (informational)
   routes/profiles.py      GET/PATCH /profiles/owner (mistake-guard token)
   routes/state.py         read-only GET /state
+  routes/schedule.py      GET /schedule, GET /awareness, POST /admin/reload-schedule
+  routes/life.py          GET /life/today, GET /life/recent, POST /life/generate
+  routes/user_schedule.py GET/PATCH /user-schedule (mistake-guard token)
 identity/                 SOUL.md / PROFILE.md / STATE.md blank templates
 schedule/needs.json       needs/interaction tuning template (conservative defaults)
+life_events/              schema_example.disabled.json (inert; author your own)
 tests/                    unittest suite (no live services required)
 ```
 
@@ -230,17 +240,19 @@ Milestone 0.1.0 scope: core transport (HTTP + WebSocket), text-only companion tu
 
 Milestone 0.2.0 scope: the speech and emotion pipeline — ElevenLabs TTS with sequential pipelined audio chunks (`done` always precedes chunks), Deepgram and AssemblyAI STT with strict audio payload validation, per-segment emotion parsing with control-tag/reasoning scrubbing, thinking status frames, the emotion-only retry, per-message language pins (en/es/ja), and owner-authored static lines (blank = protocol-only silence) for empty/failed STT. Audio is never stored server-side.
 
-Milestone 0.3.0 scope (current): needs, interaction, and the owner lived profile — the `schedule/needs.json` tuning template with stats/zones/turn effects/critical shutdown, read-only `GET /state` polls, connection bids (deterministic reply satisfaction + expiry sweep; registration arrives with initiative), metadata-only rhythm histograms, and the owner lived profile: boundary penalties (EN/ES/JA classifiers, metadata-only), reversible soft block (no LLM/bids/history writes; one authored distance line per cooldown), agreements (cap 12 active, persona-tension floors), strict-JSON proposal chain (validated/clamped, raw text never stored), status drift, and agreement aftermath. `GET/PATCH /profiles/owner` ship with the `UPDATE_OWNER_PROFILE` mistake-guard token, and the owner's preferred language joins the reply-language fallback. All of it is flag-gated OFF by default.
+Milestone 0.3.0 scope: needs, interaction, and the owner lived profile — the `schedule/needs.json` tuning template with stats/zones/turn effects/critical shutdown, read-only `GET /state` polls, connection bids (deterministic reply satisfaction + expiry sweep; registration arrives with initiative), metadata-only rhythm histograms, and the owner lived profile: boundary penalties (EN/ES/JA classifiers, metadata-only), reversible soft block (no LLM/bids/history writes; one authored distance line per cooldown), agreements (cap 12 active, persona-tension floors), strict-JSON proposal chain (validated/clamped, raw text never stored), status drift, and agreement aftermath. `GET/PATCH /profiles/owner` ship with the `UPDATE_OWNER_PROFILE` mistake-guard token, and the owner's preferred language joins the reply-language fallback. All of it is flag-gated OFF by default.
+
+Milestone 0.4.0 scope (current): real-time day schedule (`SCHEDULE_DIR` day files, DST-safe resolution, mtime hot reload, `GET /schedule`), the availability ladder (`free`/`soft_busy`/`busy`/`unavailable`; busy/unavailable messages defer into a bounded queue — first message in the window may speak the authored static line, no LLM, no fabricated speech), deferred catch-up (one answer per claimed batch under its own per-owner lock; entries restore on failure and expire after 48h), character life events (block-entry driven generation from enabled templates in `LIFE_EVENTS_DIR`, daily min/max + cooldown + skip activities, pending mentions cleared only after a delivered response, durable Redis fallback store `core:longterm:{owner}`), the awareness block + bounded `[LIFE CONTEXT]` feed (PAST/PENDING markers, `CONTEXT_FEED_MAX_TOKENS` budget), the contextual owner schedule (`GET/PATCH /user-schedule`, informational only, owner timezone changes require the `UPDATE_USER_SCHEDULE` guard), and `POST /admin/reload-schedule` (`RELOAD_SCHEDULE` guard). All flag-gated OFF by default.
 
 Planned (behind flags that default OFF):
-- Schedule & availability
 - Work mode (agentic tool use)
-- Long-term memory
+- Long-term memory (mid-term chapters + optional Chroma)
 - Initiative & proactive reach-out
 
-Speech flags (`TTS_ENABLED`, `STT_ENABLED`) and the 0.3.0 flags
+Speech flags (`TTS_ENABLED`, `STT_ENABLED`) and the 0.3.0/0.4.0 flags
 (`NEEDS_ENABLED`, `BIDS_ENABLED`, `RHYTHM_ENABLED`, `STATE_EXPRESSION_ENABLED`,
-`OWNER_PROFILE_ENABLED` and sub-flags) default OFF; when off, none of their
+`OWNER_PROFILE_ENABLED` and sub-flags, `SCHEDULE_ENABLED`, `LIFE_ENABLED`,
+`USER_SCHEDULE_ENABLED`) default OFF; when off, none of their
 stores, prompt blocks, background tasks, or LLM calls run. See
 `core.env.full.example` for the intended single-owner enabled profile.
 

@@ -13,6 +13,7 @@ import asyncio
 import fnmatch
 from collections import deque
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from core.cache import RedisCache
 from core.config import Config
@@ -33,6 +34,10 @@ class FakePipeline:
         self._ops.append(("ltrim", key, start, end))
         return self
 
+    def delete(self, key: str) -> "FakePipeline":
+        self._ops.append(("delete", key))
+        return self
+
     async def execute(self) -> list[Any]:
         results: list[Any] = []
         for op in self._ops:
@@ -48,6 +53,9 @@ class FakePipeline:
                 hi = end if end >= 0 else n + end
                 self._store[key] = rows[lo : hi + 1]
                 results.append(True)
+            elif op[0] == "delete":
+                _, key = op
+                results.append(1 if self._store.pop(key, None) is not None else 0)
         self._ops.clear()
         return results
 
@@ -227,6 +235,73 @@ class FakeTTS:
 
     async def aclose(self) -> None:
         pass
+
+
+class FakeSchedule:
+    """Scriptable schedule substitute for WS integration tests.
+
+    ``availability`` answers ``current_block()['availability']``; the block
+    is a synthetic authored block so the life engine treats it as eligible.
+    """
+
+    def __init__(self, config: Config, availability: str = "free") -> None:
+        self.config = config
+        self.availability = availability
+        self._loaded = True
+        self.tz = ZoneInfo("UTC")
+
+    @property
+    def available(self) -> bool:
+        return bool(self.config.SCHEDULE_ENABLED and self._loaded)
+
+    def load(self) -> None:
+        self._loaded = True
+
+    def maybe_reload(self) -> bool:
+        return False
+
+    def reload(self) -> dict:
+        return {"reloaded": False, "reason": "fake"}
+
+    def current_block(self, now: Any = None) -> dict:
+        import datetime as _dt
+
+        ymd = (_dt.datetime.now(_dt.timezone.utc)).date().isoformat()
+        return {
+            "block_id": f"{ymd}:0:00:00-24:00",
+            "ymd": ymd,
+            "index": 0,
+            "start": "00:00",
+            "end": "24:00",
+            "place": "home",
+            "activity": "free_time",
+            "availability": self.availability,
+            "tags": [],
+            "source": "authored",
+        }
+
+    def remaining_blocks(self, now: Any = None) -> list[dict]:
+        return []
+
+    def peek(self, now: Any = None) -> dict:
+        import datetime as _dt
+
+        ymd = (_dt.datetime.now(_dt.timezone.utc)).date().isoformat()
+        return {
+            "timezone": "UTC",
+            "date": ymd,
+            "local_time": "00:00",
+            "now": {
+                "block_id": f"{ymd}:0:00:00-24:00",
+                "place": "home",
+                "activity": "free_time",
+                "availability": self.availability,
+                "source": "authored",
+                "start": "00:00",
+                "end": "24:00",
+            },
+            "blocks": [],
+        }
 
 
 def make_config(**overrides: Any) -> Config:

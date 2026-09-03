@@ -12,7 +12,8 @@ Stats are clamped 0-100; thresholds/rates/effects/caps live in the owner-tuned
 - Everything is inert while ``NEEDS_ENABLED`` is false: no keys, no writes.
 
 Shutdown (critical social-battery/energy unavailability) is advisory
-metadata here; schedule integration arrives with milestone 0.4.0.
+metadata here; the schedule/availability gate consumes ``peek`` as of
+milestone 0.4.0 (plan section 15.4) without persisting anything.
 """
 
 from __future__ import annotations

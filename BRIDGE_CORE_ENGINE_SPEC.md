@@ -3,7 +3,7 @@
 Living implementation contract. It refines unspecified details of
 `BRIDGE_CORE_ENGINE_IMPLEMENTATION_PLAN.md`; it may not override locked
 decisions (plan section 2). Milestones implemented: **0.1.0**, **0.2.0**,
-**0.3.0**.
+**0.3.0**, **0.4.0**.
 
 ## Deviations from the plan
 
@@ -23,6 +23,21 @@ decisions (plan section 2). Milestones implemented: **0.1.0**, **0.2.0**,
   `core/routes/` package (`profiles.py`, `state.py` only so far); the needs
   tuning template stays at the plan-layout path `schedule/needs.json`
   (`NEEDS_PROFILE_FILE` overrides).
+  Milestone 0.4.0 adds `core/schedule.py`, `core/interaction.py` (deferred
+  queue + busy counters), `core/life.py`, `core/memory.py` (minimal durable
+  long-term fallback), `core/context_feed.py`, `core/user_schedule.py`, and
+  the routes `schedule.py`, `life.py`, `user_schedule.py`. The bundled
+  life-event example lives at the plan-layout path
+  `life_events/schema_example.disabled.json` (`enabled: false` — it
+  establishes no backstory); `LIFE_EVENTS_DIR` points at author-supplied
+  template directories.
+- **Implementation-specific env fields** (allowed by plan 8.3, documented
+  here): `LIFE_SKIP_ACTIVITIES` (comma-separated block activities whose
+  entries never generate life events; default `sleep`) and
+  `SCHEDULE_SOFT_BUSY_POLICY` (`normal` (default) or `short` — plan 16.3
+  leaves soft_busy reply length to "configured policy"). Owner and character
+  timezones (`OWNER_TIMEZONE`, `CHARACTER_TIMEZONE`) must be valid IANA
+  names and fail startup otherwise (plan 16.2).
 - **Voice profile "repeat variations"**: plan 14.1 lists "repeat variations"
   among voice-profile fields. The ElevenLabs chat-completions-era TTS API used
   here has no such parameter, so it is not implemented; the profile schema
@@ -127,22 +142,26 @@ milestone 0.3.0):
 - A non-empty transcript becomes a normal text companion turn; `wants_audio`
   passes through.
 
-### Companion turn (plan section 12, as of 0.3.0)
+### Companion turn (plan section 12, as of 0.4.0)
 
 Implemented hooks, in lifecycle order: soft-block gate (step 5, companion
-only) → status(thinking) → rhythm stamp (step 9, flag-gated) → turn lock →
-bid satisfaction (step 8, flag-gated) → user row persist + fanout (step 11)
-→ needs evaluate + state-expression block (step 15) → owner-profile block
-injection (step 16, first turn materializes the record) → boundary
-classification (18.4, flag-gated) → prompt → LLM → segments → assistant row
-pending → done → delivered: mark + fanout + needs turn effects + status
-drift (steps 27-29) → background strict-JSON profile analysis (step 33,
+only) → status(thinking) → availability gate + defer policy (steps 6-7:
+busy/unavailable queue the message and terminate protocol-only) → rhythm
+stamp (step 9, flag-gated) → turn lock → bid satisfaction (step 8,
+flag-gated) → user row persist + fanout (step 11) → needs evaluate +
+state-expression block (step 15) → owner-profile block injection (step 16,
+first turn materializes the record) → boundary classification (18.4,
+flag-gated) → awareness + bounded context feed (step 14, identity layer 5)
+→ prompt → LLM → segments → assistant row pending → done → delivered: mark
++ fanout + needs turn effects + status drift + pending-life clear
+(steps 27-29, 34) → background strict-JSON profile analysis (step 33,
 flag-gated, delivered exchanges only) → TTS stream (step 31, outside the
+lock) → optional catch-up of held companion messages (plan 16.3, own
 lock).
 
 Skipped hooks (they do not exist yet; flags off, no keys, no tasks, no LLM
-calls): schedule/availability (0.4.0), life mentions (0.4.0), memory
-retrieval/extraction (0.6.0), catch-up (0.4.0), initiative (0.7.0).
+calls): work sessions/tooling (0.5.0), memory retrieval/extraction
+(0.6.0), initiative (0.7.0).
 
 - User rows persist with `delivery_state: "delivered"` (they were received
   from the owner device) **before** the provider call; `chat_sync` fanout
@@ -246,7 +265,8 @@ retrieval/extraction (0.6.0), catch-up (0.4.0), initiative (0.7.0).
 - A blank value in the pinned language is deliberate silence — protocol-only
   metadata, **no cross-language fallback**.
 - 0.2.0 uses `stt_empty` (empty and failed STT); 0.3.0 adds `soft_block`.
-  `busy`/`unavailable` arrive with schedule (0.4.0).
+  `busy`/`unavailable` arrive with schedule (0.4.0), spoken at most once
+  per busy window (see the 0.4.0 section).
 
 ## Milestone 0.3.0 — needs, interaction, and owner profile
 
@@ -433,6 +453,141 @@ integration tests):
   tests. Loopback binds short-circuit before enumeration so development needs
   no Tailscale.
 
+## Milestone 0.4.0 — schedule, life, awareness, catch-up
+
+### Real-time schedule (plan section 16)
+
+- Day resolution: `mon.json`..`sun.json` if present, else `weekday.json`
+  (Mon–Fri) / `weekend.json` (Sat–Sun); missing files yield one all-day
+  default block and a warning. `SCHEDULE_DIR` empty/missing ⇒ all-day
+  defaults (schedule stays available, availability `free`).
+- Blocks: inclusive start / exclusive end; `24:00` only as an end; single
+  overnight blocks rejected; normalized overlaps rejected; availability in
+  `free|soft_busy|busy|unavailable`. Invalid startup/reload keeps the last
+  valid schedule.
+- Block ids are `{ymd}:{index}:{start}-{end}`; gap blocks get `{ymd}:gap`
+  and are synthetic: they never trigger life generation and never enter
+  life bookkeeping.
+- DST (plan 16.2): nonexistent local times advance to the next valid
+  instant; repeated local times take the first occurrence for starts and
+  the second for ends (both transitions covered by tests).
+- Hot reload by mtime on turn/availability evaluation; explicit
+  `POST /admin/reload-schedule` (body token `{"confirm": "RELOAD_SCHEDULE"}`)
+  rejects an invalid day with 400 `invalid_schedule` and keeps the previous
+  schedule. Hot reload never retro-generates life events for prior blocks;
+  only a **new** current block id may generate one event.
+
+### Availability ladder and defer (plan sections 12 steps 6-7, 15.4, 16.3)
+
+- Effective availability = schedule block availability, downgraded to
+  `unavailable` by critical needs shutdown (via needs `peek` — the gate
+  never persists). Soft block is handled earlier (plan 12 step 5).
+- `free` → normal reply; `soft_busy` → normal reply, or a brief
+  `[AVAILABILITY]` system note when `SCHEDULE_SOFT_BUSY_POLICY=short`.
+- `busy`/`unavailable` → the message is appended to the deferred queue and
+  the turn terminates with `done` `ignored: true`,
+  `reason: "busy"|"unavailable"`, `deferred: true` — no LLM call, no
+  history write, no bids/needs effects, no boundary classification (held
+  texts classify at catch-up). The first message in a busy window
+  (`core:busy_count:{owner}` == 0) may speak the authored `busy` /
+  `unavailable` static line; repeated messages are protocol-only. Skipped
+  hooks are exactly the ones named here (plan 12 "early refusal" law).
+- Queue (`core:deferred:{owner}` document): ≤ 5 entries and ≤ 4,000 UTF-8
+  bytes total; oldest drops first with a warning; dedupe by original
+  message id preserving arrival order; entries expire after 48h
+  (`expires_ts`), expire without answer, and increment a bounded
+  `expired_count` diagnostic; drops increment `dropped_count`.
+- All queue mutations and claims run under a dedicated per-owner
+  **catch-up lock** (plan section 11).
+
+### Deferred catch-up (plan section 16.3)
+
+- Triggers: after every delivered companion turn, and from heartbeat
+  maintenance (throttled to at most once per minute), when
+  `SCHEDULE_ENABLED`.
+- Guards: availability must be `free|soft_busy`; the per-owner turn lock
+  must be free (a later trigger retries); at least one live owner
+  connection must exist (target = the triggering connection, else the most
+  recent owner connection; without one, entries restore to `held`).
+- Flow (under the catch-up lock, history under the per-owner turn lock):
+  claim companion entries `held → delivering` (work entries are never
+  claimed by the companion path) → persist each held text as a **deduped**
+  delivered user row (`chat_sync` fanned out with the original deferring
+  connection id) → one prompt (`build_catchup_prompt`, `[CATCH-UP]` note)
+  containing the bounded batch → companion-mode LLM → usual emotion
+  validation/retry → assistant row pending → done (extra metadata
+  `catchup: true`, `initiated_by: "character"`) → delivered: mark +
+  assistant fanout + needs turn effects + status drift + pending-life
+  clear; only then are claimed entries removed and the busy window reset.
+  Generation or delivery failure restores entries to `held` (expired ones
+  drop), the assistant row (if any) is marked undelivered, and the already
+  persisted user rows remain (retry dedupes by message id).
+- Work catch-up (text-only, tool-less) ships with work mode in 0.5.0; the
+  mode field and separate claim filters are in place now.
+
+### Character life (plan section 17)
+
+- Requires `SCHEDULE_ENABLED` (block-entry driven). `LIFE_ENABLED` without
+  a schedule logs a warning and stays inert.
+- Templates: `*.json` in `LIFE_EVENTS_DIR`; malformed files fail startup;
+  only `enabled: true` templates participate. Matching is deterministic:
+  activities / places / schedule_tags (intersect) / time_of_day buckets;
+  weighted random choice among matches (no match ⇒ no generation).
+- Generation runs only on **new authored block ids** claimed before the
+  LLM call (single-writer life lock + one state document). One event max
+  per block; daily max hard; daily min forces the next eligible block only
+  as a chance-selection override (0.4.0 generation is deterministic, so
+  the seat exists but is not normally reached); cooldown enforced for all
+  poll-driven generation; admin force bypasses only the cooldown and the
+  failed-block retry bar — never the daily max.
+- The `life`-mode LLM reply is sanitized (control tags/asterisk actions
+  stripped, clamped to 500 chars) and stored through the durable Redis
+  long-term fallback (`core:longterm:{owner}`) as
+  `kind=character_life_event` with block metadata and `past: true`. Failed
+  generation retains the claimed block with `generation_failed: true` and
+  is never retried by the poll loop; `POST /life/generate` (body token
+  `GENERATE_LIFE`, optional `force`) is the explicit retry path.
+- Pending mentions (`core:life:pending:{owner}`, bounded ring) clear only
+  after a successful companion response that received the context (the
+  feed reports which pending ids rendered; plan 12 step 34).
+- `LIFE_MISSED_BLOCK_POLICY=current_only`: the poll evaluates only the
+  current block; nothing is fabricated for offline periods.
+- Reads: `GET /life/today`, `GET /life/recent?limit=` are pure polls over
+  the durable store.
+
+### Awareness and context feed (plan section 21)
+
+- The awareness block renders when `SCHEDULE_ENABLED` or
+  `USER_SCHEDULE_ENABLED` (flag-off parity: never with both off). It
+  carries owner local time (connection timezone → `OWNER_TIMEZONE`
+  fallback), character local time, character schedule now, time since the
+  last conversation, and the owner-schedule state ("informational only"
+  is part of the block text). Zero extra LLM calls.
+- The bounded context feed (`[LIFE CONTEXT]`) renders recent life events
+  marked PAST plus pending mentions marked PENDING; the same event is
+  never injected twice; pending rows win slots and are the only ids that
+  may be cleared later. The hard budget is `CONTEXT_FEED_MAX_TOKENS`
+  enforced by the deterministic ~4-chars-per-token estimate (plan 4.2
+  fallback). Mid-term chapters, durable memory rows beyond life, and
+  project context join in later milestones — the renderer is already the
+  single injection point (plan 20.4).
+
+### Contextual owner schedule (plan section 22)
+
+- Store: `core:user_schedule:{owner}` (baseline week + timezone) and
+  `core:user_schedule:day:{owner}:{ymd}` (per-date overrides). States
+  `busy|free|sleep|unknown`; unknown is never free; empty/missing store ⇒
+  everything unknown; GET never materializes (plan 6.4).
+- `PATCH /user-schedule` requires the `UPDATE_USER_SCHEDULE`
+  mistake-guard header. Accepted fields: `timezone` (valid IANA; **this
+  endpoint is the only path that changes the durable owner-schedule
+  timezone**), `days` (day key → blocks, replaces those days), and
+  `date` + `blocks` (one per-date override). Unknown fields → 400
+  `invalid_patch`. Blocks reuse the schedule time rules (HH:MM, `24:00`
+  end-only, no overlap) and DST semantics.
+- Usage in 0.4.0: awareness context only. Initiative gating and daily-tool
+  access arrive with their milestones.
+
 ## Testing contract
 
 - `tests/fakes.py::FakeRedis` implements the exact async subset
@@ -448,23 +603,32 @@ integration tests):
 - `tests/fakes.py::FakeNeeds` / `FakeOwnerProfile` are scriptable engine
   substitutes for the bridge-facing 0.3.0 surfaces; the enabled-profile
   integration tests exercise the real engines over `FakeRedis`.
+- `tests/fakes.py::FakeSchedule` is a scriptable schedule substitute
+  (settable availability) so availability/catch-up integration needs no
+  schedule files; the schedule/life engine tests exercise the real engines
+  over `FakeRedis` with temp dirs and fixed clocks.
 - Speech-service unit tests use `httpx.MockTransport` responders that record
   requests and replay scripted responses.
 - HTTP+WS tests use FastAPI's `TestClient`; no network, no live Redis.
 
-## Redis keys in 0.1.0–0.3.0
+## Redis keys in 0.1.0–0.4.0
 
 `core:history:{owner}:companion` (list of JSON rows: `id`, `role`, `text`,
 `emotion`, `ts`, `delivery_state`) is the only key a flags-off deployment
 ever creates — the flag-off parity tests assert no other keys after turns
 and polls. With 0.3.0 flags enabled, the single-document keys
 `core:needs:{owner}`, `core:bids:{owner}`, `core:rhythm:{owner}`, and
-`core:owner_profile:{owner}` may appear (see the milestone 0.3.0 section).
-**Audio is never stored server-side** — audio bytes exist only in flight,
-and the STT/TTS paths write no keys. All other keys in plan section 28
-belong to later milestones.
+`core:owner_profile:{owner}` may appear. With 0.4.0 flags enabled:
+`core:longterm:{owner}` (list of durable memory records),
+`core:life:last_block:{owner}` and `core:life:pending:{owner}`
+(LIFE_ENABLED), `core:deferred:{owner}` (document; absent when empty) and
+`core:busy_count:{owner}` (SCHEDULE_ENABLED defers), and
+`core:user_schedule:{owner}` / `core:user_schedule:day:{owner}:{ymd}`
+(USER_SCHEDULE_ENABLED writes). **Audio is never stored server-side** —
+audio bytes exist only in flight, and the STT/TTS paths write no keys. All
+other keys in plan section 28 belong to later milestones.
 
 ## Version source
 
-`core/constants.py::VERSION = "0.3.0"` is the single source; the entrypoint
+`core/constants.py::VERSION = "0.4.0"` is the single source; the entrypoint
 docstring, README, `connected` frame, and `/status` derive from it.

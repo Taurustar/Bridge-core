@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 
 # ---------------------------------------------------------------------------
 # Emotion palette (plan section 13.1). The v1 palette is fixed for wire
@@ -149,3 +149,62 @@ def owner_profile_key(owner_user_id: str) -> str:
 # Owner-profile admin mistakes are guarded by this literal token (plan 18.7).
 # It is an obvious-to-a-human string, not a secret; it is never logged at INFO.
 UPDATE_OWNER_PROFILE_TOKEN = "UPDATE_OWNER_PROFILE"
+
+# Confirm tokens (plan section 29). Mistake guards, not authentication.
+GENERATE_LIFE_TOKEN = "GENERATE_LIFE"
+RELOAD_SCHEDULE_TOKEN = "RELOAD_SCHEDULE"
+UPDATE_USER_SCHEDULE_TOKEN = "UPDATE_USER_SCHEDULE"
+
+# ---------------------------------------------------------------------------
+# Schedule availability ladder (plan sections 16.1, 16.3).
+# ---------------------------------------------------------------------------
+
+AVAILABILITIES: tuple[str, ...] = ("free", "soft_busy", "busy", "unavailable")
+
+# Safe default block for schedule gaps (plan section 16.2). Synthetic: life
+# events never generate on it and it carries no authored block id.
+GAP_BLOCK: dict[str, object] = {
+    "place": "unknown",
+    "activity": "unplanned",
+    "availability": "free",
+    "tags": [],
+}
+
+# Contextual owner-schedule states (plan section 22.3). Unknown is not free.
+USER_SCHEDULE_STATES: tuple[str, ...] = ("busy", "free", "sleep", "unknown")
+
+# Deferred queue bounds (plan section 16.3).
+DEFERRED_MAX_ENTRIES = 5
+DEFERRED_MAX_TOTAL_CHARS = 4000
+DEFERRED_TTL_SECONDS = 48 * 3600
+
+# Time-of-day buckets used by life-template matching (plan section 17.1).
+TIME_OF_DAY_BUCKETS: tuple[str, ...] = ("morning", "afternoon", "evening", "night")
+
+
+def deferred_key(owner_user_id: str) -> str:
+    return f"core:deferred:{owner_user_id}"
+
+
+def busy_count_key(owner_user_id: str) -> str:
+    return f"core:busy_count:{owner_user_id}"
+
+
+def longterm_key(owner_user_id: str) -> str:
+    return f"core:longterm:{owner_user_id}"
+
+
+def life_last_block_key(owner_user_id: str) -> str:
+    return f"core:life:last_block:{owner_user_id}"
+
+
+def life_pending_key(owner_user_id: str) -> str:
+    return f"core:life:pending:{owner_user_id}"
+
+
+def user_schedule_key(owner_user_id: str) -> str:
+    return f"core:user_schedule:{owner_user_id}"
+
+
+def user_schedule_day_key(owner_user_id: str, ymd: str) -> str:
+    return f"core:user_schedule:day:{owner_user_id}:{ymd}"

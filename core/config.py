@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field, fields
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from dotenv import dotenv_values
 
@@ -249,6 +250,7 @@ class Config:
     LIFE_EVENT_COOLDOWN_MINUTES: int = 40
     LIFE_POLL_INTERVAL_SECONDS: int = 60
     LIFE_MISSED_BLOCK_POLICY: str = "current_only"
+    LIFE_SKIP_ACTIVITIES: str = "sleep"
 
     # Heartbeat initiative
     HEARTBEAT_ENABLED: bool = True
@@ -292,6 +294,7 @@ class Config:
 
     # Contextual owner schedule
     USER_SCHEDULE_ENABLED: bool = False
+    SCHEDULE_SOFT_BUSY_POLICY: str = "normal"
 
     # Input and context budgets
     MAX_AUDIO_BYTES: int = 15728640
@@ -360,6 +363,14 @@ class Config:
         """Cross-field validation with clear startup errors."""
         if not self.OWNER_USER_ID.strip():
             raise ConfigError("OWNER_USER_ID must not be empty")
+        for tz_field in ("OWNER_TIMEZONE", "CHARACTER_TIMEZONE"):
+            tz_name = getattr(self, tz_field)
+            try:
+                ZoneInfo(tz_name)
+            except (ZoneInfoNotFoundError, ValueError, KeyError):
+                raise ConfigError(
+                    f"{tz_field} must be a valid IANA timezone (got {tz_name!r})"
+                ) from None
         if not (1 <= self.BRIDGE_PORT <= 65535):
             raise ConfigError(
                 f"BRIDGE_PORT out of range: {self.BRIDGE_PORT} (expected 1..65535)"
@@ -407,6 +418,26 @@ class Config:
                 raise ConfigError(f"{penalty_name} must be positive")
         if self.OWNER_SOFT_BLOCK_UNBLOCK_TRUST_FLOOR < 0:
             raise ConfigError("OWNER_SOFT_BLOCK_UNBLOCK_TRUST_FLOOR must be >= 0")
+        self.LIFE_MISSED_BLOCK_POLICY = self.LIFE_MISSED_BLOCK_POLICY.strip().lower()
+        if self.LIFE_MISSED_BLOCK_POLICY not in ("current_only",):
+            raise ConfigError(
+                "LIFE_MISSED_BLOCK_POLICY must be current_only "
+                f"(got {self.LIFE_MISSED_BLOCK_POLICY!r})"
+            )
+        if self.LIFE_DAILY_MIN < 0 or self.LIFE_DAILY_MAX < 0:
+            raise ConfigError("LIFE_DAILY_MIN and LIFE_DAILY_MAX must be >= 0")
+        if self.LIFE_DAILY_MIN > self.LIFE_DAILY_MAX:
+            raise ConfigError("LIFE_DAILY_MIN must not exceed LIFE_DAILY_MAX")
+        if self.LIFE_POLL_INTERVAL_SECONDS < 1:
+            raise ConfigError("LIFE_POLL_INTERVAL_SECONDS must be at least 1")
+        if self.LIFE_EVENT_COOLDOWN_MINUTES < 0:
+            raise ConfigError("LIFE_EVENT_COOLDOWN_MINUTES must be >= 0")
+        self.SCHEDULE_SOFT_BUSY_POLICY = self.SCHEDULE_SOFT_BUSY_POLICY.strip().lower()
+        if self.SCHEDULE_SOFT_BUSY_POLICY not in ("normal", "short"):
+            raise ConfigError(
+                "SCHEDULE_SOFT_BUSY_POLICY must be normal or short "
+                f"(got {self.SCHEDULE_SOFT_BUSY_POLICY!r})"
+            )
         if unknown:
             raise ConfigError(
                 f"LLM_CHAIN contains unknown providers: {', '.join(unknown)}"

@@ -1,12 +1,13 @@
-"""Prompt builders (plan sections 7.2, 7.3).
+"""Prompt builders (plan sections 7.2, 7.3, 16.3, 17.2, 21).
 
-Milestones 0.1.0-0.3.0 ship the companion builder plus the owner-profile
-analysis builder. Builders receive explicit inputs and never reach into a
-global bridge object.
+Milestones 0.1.0-0.4.0 ship the companion builder, the owner-profile
+analysis builder, the catch-up builder, and the life-event builder. Builders
+receive explicit inputs and never reach into a global bridge object.
 
 Structural laws are engine behavior, not character personality: identity
 content comes exclusively from the owner's SOUL.md / PROFILE.md files, and
-state/relationship blocks inject authored context without numeric scores.
+state/relationship/awareness/life blocks inject authored context without
+numeric scores.
 """
 
 from __future__ import annotations
@@ -33,14 +34,17 @@ def build_companion_prompt(
     language: str = "en",
     state_block: str = "",
     owner_block: str = "",
+    awareness_block: str = "",
+    context_feed: str = "",
+    soft_busy_note: bool = False,
 ) -> list[dict]:
     """Build the chat-completions message list for a companion turn.
 
     Identity authority order (plan section 6.3): SOUL.md, then PROFILE.md,
     then the STATE.md expression output for this turn, then the owner lived
-    profile, then structural laws, then live history, then post-history
-    critical rules with the per-turn language lock, then the current user
-    input last (plan section 12 steps 17-19).
+    profile, then the awareness/context-feed blocks, then structural laws,
+    then live history, then post-history critical rules with the per-turn
+    language lock, then the current user input last (plan 12 steps 17-19).
     """
     system_parts: list[str] = []
     if soul_text.strip():
@@ -51,6 +55,15 @@ def build_companion_prompt(
         system_parts.append(state_block.strip())
     if owner_block.strip():
         system_parts.append(owner_block.strip())
+    if awareness_block.strip():
+        system_parts.append(awareness_block.strip())
+    if context_feed.strip():
+        system_parts.append(context_feed.strip())
+    if soft_busy_note:
+        system_parts.append(
+            "[AVAILABILITY]\nYou are only semi-available right now; keep the "
+            "reply brief, then return to what you were doing."
+        )
     system_parts.append(STRUCTURAL_LAWS.strip())
 
     messages: list[dict] = [{"role": "system", "content": "\n\n".join(system_parts)}]
@@ -71,6 +84,51 @@ def build_companion_prompt(
         }
     )
     messages.append({"role": "user", "content": current_text})
+    return messages
+
+
+_CATCHUP_NOTE = """\
+[CATCH-UP]
+The owner sent the following message(s) while you were unavailable. They are
+reproduced together below as one batch. Answer once, in a single reply that
+acknowledges them naturally. Do not mention queues, systems, availability
+mechanics, or that messages were held."""
+
+
+def build_catchup_prompt(
+    *,
+    soul_text: str,
+    profile_text: str,
+    history: list[dict],
+    held_messages: list[str],
+    language: str = "en",
+    state_block: str = "",
+    owner_block: str = "",
+    awareness_block: str = "",
+    context_feed: str = "",
+) -> list[dict]:
+    """One prompt answering all held companion messages (plan section 16.3).
+
+    ``held_messages`` are the bounded, verbatim owner texts from the deferred
+    queue — the batch user message is real owner content, never fabricated.
+    The catch-up framing note is inserted right after the identity system
+    message so it precedes live history.
+    """
+    batch = "\n---\n".join(
+        message.strip() for message in held_messages if str(message).strip()
+    )
+    messages = build_companion_prompt(
+        soul_text=soul_text,
+        profile_text=profile_text,
+        history=history,
+        current_text=batch,
+        language=language,
+        state_block=state_block,
+        owner_block=owner_block,
+        awareness_block=awareness_block,
+        context_feed=context_feed,
+    )
+    messages.insert(1, {"role": "system", "content": _CATCHUP_NOTE})
     return messages
 
 
@@ -168,3 +226,51 @@ def _compact_profile(profile: dict) -> str:
     import json
 
     return json.dumps(view, ensure_ascii=False)
+
+
+_LIFE_RULES = """\
+Write ONE short past-tense account of something that happened to you during
+this block, in first person, in your own voice. Plain text only: no emotion
+tags, no asterisk actions, no lists, at most two short sentences. It must be
+plausible for the place and activity given, and consistent with the identity
+files above. Do not mention the owner unless the inspiration implies them."""
+
+
+def build_life_prompt(
+    *,
+    template: dict,
+    block: dict,
+    language: str = "en",
+    soul_text: str = "",
+    profile_text: str = "",
+) -> list[dict]:
+    """Lightweight life-event generation prompt (plan sections 7.2, 17.2).
+
+    ``template`` is the matched, validated life-event template; ``block`` is
+    the current authored schedule block. Output is a bounded plain-text past
+    experience, never a spoken reply and never an old event posed as current.
+    """
+    system_parts: list[str] = []
+    if soul_text.strip():
+        system_parts.append(soul_text.strip())
+    if profile_text.strip():
+        system_parts.append(profile_text.strip())
+    system_parts.append(_LIFE_RULES)
+    inspiration = str(template.get("description", "")).strip()
+    examples = [str(item).strip() for item in (template.get("examples") or []) if str(item).strip()]
+    user_parts = [
+        f"Schedule block: {block.get('start') or ''}-{block.get('end') or ''} "
+        f"(place: {block.get('place')}, activity: {block.get('activity')})",
+    ]
+    if block.get("tags"):
+        user_parts.append(f"Block tags: {', '.join(block['tags'])}")
+    if inspiration:
+        user_parts.append(f"Inspiration: {inspiration}")
+    if examples:
+        user_parts.append("Tone examples (do not copy verbatim):")
+        user_parts.extend(f"- {item}" for item in examples[:3])
+    user_parts.append(f"Write the account in language: {language}.")
+    return [
+        {"role": "system", "content": "\n\n".join(system_parts)},
+        {"role": "user", "content": "\n".join(user_parts)},
+    ]

@@ -52,6 +52,7 @@ class ConnectionManager:
         self._by_user: dict[str, set[str]] = {}
         self._turn_locks: dict[str, asyncio.Lock] = {}
         self._profile_locks: dict[str, asyncio.Lock] = {}
+        self._catchup_locks: dict[str, asyncio.Lock] = {}
         self._pending: dict[str, asyncio.Future] = {}
 
     def connect(
@@ -118,6 +119,15 @@ class ConnectionManager:
         if lock is None:
             lock = asyncio.Lock()
             self._profile_locks[user_id] = lock
+        return lock
+
+    def catchup_lock(self, user_id: str) -> asyncio.Lock:
+        """Per-owner catch-up lock, separate from the turn lock, preventing
+        duplicate catch-up sends (plan section 11)."""
+        lock = self._catchup_locks.get(user_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._catchup_locks[user_id] = lock
         return lock
 
     async def fan_out(

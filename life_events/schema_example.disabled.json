@@ -1,0 +1,13 @@
+{
+  "id": "schema_example",
+  "enabled": false,
+  "description": "Author-defined event inspiration.",
+  "tags": [],
+  "activities": [],
+  "places": [],
+  "schedule_tags": [],
+  "time_of_day": [],
+  "weight": 1.0,
+  "importance": 0.4,
+  "examples": []
+}

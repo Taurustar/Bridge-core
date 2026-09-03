@@ -1,29 +1,34 @@
-"""Bridge: wiring and companion turn lifecycle (plan sections 10-12, 14-15, 18).
+"""Bridge: wiring and companion turn lifecycle (plan sections 10-12, 14-18, 21-22).
 
-Holds the config, cache, connection manager, LLM router, speech services, and
-the 0.3.0 needs/interaction/owner-profile engines, and implements the companion
-turn (text and audio), heartbeat handling, status frames, and the sequential
-pipelined TTS chunk stream.
+Holds the config, cache, connection manager, LLM router, speech services, the
+0.3.0 needs/interaction/owner-profile engines, and the 0.4.0 schedule, life,
+awareness, catch-up, and contextual owner-schedule engines.
 
-Turn lifecycle (schedule/availability, memory, life, catch-up, and initiative
-hooks do not exist yet and remain flag-off inert):
+Turn lifecycle (work sessions, memory extraction, and initiative do not exist
+yet and remain flag-off inert):
 
 validate owner -> non-empty text -> soft-block gate (plan 12 step 5; while
 blocked: one authored distance line per cooldown, no LLM/bids/history writes)
--> status(thinking) to source -> rhythm stamp -> per-owner turn lock -> bid
-satisfaction -> persist user row (delivered) BEFORE provider call -> fan out
-user chat_sync -> needs evaluate + [CHARACTER STATE] + owner lived profile
-blocks -> build prompt -> LLM router -> validate/parse reply segments
-(emotion-only retried once) -> append assistant row (pending) -> send done to
-source -> delivered: mark delivered + fan out assistant chat_sync + needs turn
-effects; failed: mark undelivered, excluded from future prompts -> release
-lock -> strict-JSON owner-profile analysis (flag-gated, background) ->
+-> status(thinking) to source -> schedule availability gate (plan 12 steps
+6-7: busy/unavailable defers into the bounded queue without fabricated
+speech; first message in the window may speak the authored static line) ->
+rhythm stamp -> per-owner turn lock -> bid satisfaction -> persist user row
+(delivered) BEFORE provider call -> fan out user chat_sync -> needs evaluate
++ [CHARACTER STATE] + owner lived profile + awareness/context-feed blocks ->
+build prompt -> LLM router -> validate/parse reply segments (emotion-only
+retried once) -> append assistant row (pending) -> send done to source ->
+delivered: mark delivered + fan out assistant chat_sync + needs turn effects
++ clear delivered pending life mentions; failed: mark undelivered, excluded
+from future prompts -> release lock -> optional catch-up of held companion
+messages -> strict-JSON owner-profile analysis (flag-gated, background) ->
 pipelined sequential TTS chunks to the source connection only.
 
 Every turn terminates with a ``done`` frame or a terminal error frame (plan
 section 30.2). Empty/failed STT returns a localized static line (or
 protocol-only metadata) with a terminal ``done`` and makes no LLM/history
-call.
+call. Catch-up runs under its own per-owner lock and only when availability
+is free/soft_busy; work/companion deferred entries stay separated by mode
+(work itself ships in 0.5.0).
 """
 
 from __future__ import annotations
@@ -33,8 +38,10 @@ import base64
 import json
 import logging
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import WebSocket, WebSocketDisconnect
 
@@ -52,8 +59,12 @@ from .constants import (
     SUPPORTED_LANGUAGES,
     VERSION,
 )
+from .context_feed import build_awareness_block, build_context_feed
 from .emotions import load_emotions_manifest
+from .interaction import DeferredQueue
+from .life import LifeEngine
 from .llm import LLMChainExhausted, LLMResult, LLMRouter
+from .memory import LongTermMemory
 from .needs import NeedsEngine, classify_turn_kind
 from .owner_profile import (
     PROPOSAL_MAX_DELTA,
@@ -62,8 +73,13 @@ from .owner_profile import (
     owner_relationship_block,
     validate_and_apply_proposal,
 )
-from .prompts import build_companion_prompt, build_owner_profile_analysis_prompt
+from .prompts import (
+    build_catchup_prompt,
+    build_companion_prompt,
+    build_owner_profile_analysis_prompt,
+)
 from .rhythm import RhythmEngine
+from .schedule import Schedule
 from .speech import (
     AudioValidationError,
     SpeechProviderError,
@@ -76,6 +92,7 @@ from .speech import (
 from .state_expression import build_state_block
 from .static_lines import get_static_line, load_static_lines
 from .text_utils import chunk_segments, join_segments, parse_emotion_segments
+from .user_schedule import UserSchedule
 
 log = logging.getLogger("bridge.turn")
 
@@ -155,6 +172,11 @@ class Bridge:
         self.bids = BidsEngine(config, cache)
         self.rhythm = RhythmEngine(config, cache)
         self.owner_profile = OwnerProfile(config, cache)
+        self.deferred = DeferredQueue(config, cache)
+        self.user_schedule = UserSchedule(config, cache)
+        self.longterm = LongTermMemory(config, cache)
+        self.schedule: Schedule | None = None
+        self.life: LifeEngine | None = None
         self.emotions_manifest: dict = {}
         self.static_lines: dict = {}
         self.deployment_mode = "unknown"
@@ -162,6 +184,8 @@ class Bridge:
         self._identity_cache: dict[str, tuple[float, str]] = {}
         self._started_monotonic = time.monotonic()
         self._last_bid_sweep = 0.0
+        self._life_task: asyncio.Task | None = None
+        self._life_stop: asyncio.Event | None = None
 
     # -- startup -------------------------------------------------------------
 
@@ -183,6 +207,25 @@ class Bridge:
             self.owner_profile.tuning = self.needs.owner_profile_config()
         if self.config.OWNER_PROFILE_ENABLED:
             self.owner_profile.tuning = self.needs.owner_profile_config()
+        # Schedule, life, awareness, catch-up, and contextual owner schedule
+        # (plan sections 16, 17, 21, 22). All flag-gated.
+        if self.config.SCHEDULE_ENABLED:
+            self.schedule = Schedule(self.config)
+            self.schedule.load()
+            if self.config.LIFE_ENABLED:
+                self.life = LifeEngine(
+                    self.config, self.cache, self.schedule, self.longterm, self.llm
+                )
+                self.life.load_templates()
+                self._life_stop = asyncio.Event()
+                self._life_task = asyncio.create_task(
+                    self.life.poll_loop(self.config.OWNER_USER_ID, self._life_stop)
+                )
+        elif self.config.LIFE_ENABLED:
+            log.warning(
+                "LIFE_ENABLED requires SCHEDULE_ENABLED (life generates at "
+                "block entry); life stays inert"
+            )
 
     def capabilities(self) -> list[str]:
         """What this build actually supports right now (see SPEC)."""
@@ -623,13 +666,21 @@ class Bridge:
             }
         )
         # Bids expire deterministically; sweep during heartbeat maintenance
-        # at most once per minute (plan section 15.5).
+        # at most once per minute (plan section 15.5). The same maintenance
+        # tick checks for due companion catch-ups (plan section 16.3).
         now = time.monotonic()
-        if self.bids.available and now - self._last_bid_sweep >= 60.0:
+        if now - self._last_bid_sweep >= 60.0:
             self._last_bid_sweep = now
-            sweep_task = asyncio.create_task(self._sweep_bids(owner_id=conn.user_id))
-            self.background_tasks.add(sweep_task)
-            sweep_task.add_done_callback(self.background_tasks.discard)
+            if self.bids.available:
+                sweep_task = asyncio.create_task(self._sweep_bids(owner_id=conn.user_id))
+                self.background_tasks.add(sweep_task)
+                sweep_task.add_done_callback(self.background_tasks.discard)
+            if self.schedule is not None and self.schedule.available:
+                catchup_task = asyncio.create_task(
+                    self._maybe_catchup(conn.user_id, trigger_conn=conn)
+                )
+                self.background_tasks.add(catchup_task)
+                catchup_task.add_done_callback(self.background_tasks.discard)
 
     async def _sweep_bids(self, owner_id: str) -> None:
         try:
@@ -679,6 +730,422 @@ class Bridge:
         log.info("Companion turn suppressed by soft block")
         return done
 
+    # -- schedule availability, defer, and catch-up (plan sections 12, 16.3) -----
+
+    def _resolve_zone(self, tz_name: str) -> ZoneInfo:
+        try:
+            return ZoneInfo(tz_name)
+        except (ZoneInfoNotFoundError, ValueError, KeyError):
+            return ZoneInfo("UTC")
+
+    async def _effective_availability(self, owner: str) -> str:
+        """Raw schedule availability combined with critical needs shutdown
+        (plan section 15.4). Soft block is handled earlier (plan 12 step 5).
+        Uses needs ``peek`` — the gate never persists lazy state (plan 6.4)."""
+        availability = "free"
+        if self.schedule is not None and self.schedule.available:
+            self.schedule.maybe_reload()
+            availability = str(self.schedule.current_block()["availability"])
+        if self.needs.available:
+            try:
+                snapshot = await self.needs.peek(owner)
+                if snapshot.get("shutdown"):
+                    availability = "unavailable"
+            except Exception:  # noqa: BLE001 - advisory gate never fails a turn
+                log.debug("needs peek for availability failed", exc_info=True)
+        return availability
+
+    async def _defer_turn(
+        self,
+        owner: str,
+        *,
+        text: str,
+        language: str,
+        source_conn: Connection | None,
+        availability: str,
+    ) -> dict:
+        """Busy/unavailable ladder (plan section 16.3).
+
+        The message is queued for one later catch-up answer; no LLM call, no
+        history write, no bids/needs effects run on this path. The first
+        message in a busy window may speak the authored static line;
+        repeated messages defer protocol-only. Skipped hooks (do not run):
+        bids, needs effects, boundary classification (classified at
+        catch-up), history persistence, memory/analysis.
+        """
+        user_row = hist.make_row("user", text.strip(), hist.DELIVERED)
+        origin = source_conn.connection_id if source_conn is not None else "http"
+        async with self.connections.catchup_lock(owner):
+            window_count = await self.deferred.busy_count(owner)
+            await self.deferred.append(
+                owner,
+                message_id=user_row["id"],
+                mode="companion",
+                text=text.strip(),
+                source_connection_id=origin,
+            )
+            await self.deferred.increment_busy(owner)
+        done: dict[str, Any] = {
+            "type": "done",
+            "id": hist.new_message_id(),
+            "mode": "companion",
+            "emotion": DEFAULT_EMOTION,
+            "ignored": True,
+            "reason": availability,
+            "deferred": True,
+            "initiated_by": "user",
+        }
+        if window_count == 0:
+            line = get_static_line(self.static_lines, availability, language)
+            if line:
+                done["text"] = line
+                done["segments"] = [{"text": line, "emotion": DEFAULT_EMOTION}]
+        if source_conn is not None:
+            await source_conn.send_json(done)
+        log.info(
+            "Companion message deferred (availability=%s, window_count=%d)",
+            availability,
+            window_count,
+        )
+        return done
+
+    async def _build_prompt_blocks(
+        self,
+        owner: str,
+        *,
+        source_conn: Connection | None,
+        prompt_history: list[dict],
+    ) -> dict:
+        """Shared per-turn block building (plan 12 steps 14-16, 21).
+
+        Returns state/owner/awareness/context-feed blocks plus the prompt
+        profile and the pending life-mention ids included in the feed.
+        """
+        state_block = ""
+        owner_block = ""
+        prompt_profile: dict | None = None
+        if self.needs.available:
+            snapshot = await self.needs.evaluate(owner)
+            if self.config.STATE_EXPRESSION_ENABLED:
+                state_block = build_state_block(
+                    snapshot["zones"], self._read_identity("state")
+                )
+        if self.owner_profile.available:
+            prompt_profile = await self.owner_profile.get(owner)
+            if prompt_profile is None:
+                prompt_profile = await self.owner_profile.upsert(
+                    owner,
+                    default_profile(self.config),
+                    expected_version=1,
+                ) or default_profile(self.config)
+            if self.config.OWNER_PROFILE_INJECT:
+                blocked_now = bool(
+                    self.config.OWNER_SOFT_BLOCK_ENABLED
+                    and prompt_profile.get("soft_blocked")
+                )
+                owner_block = owner_relationship_block(
+                    prompt_profile, soft_blocked=blocked_now
+                )
+        awareness_block = ""
+        context_feed_text = ""
+        pending_life_ids: list[str] = []
+        if self.config.SCHEDULE_ENABLED or self.config.USER_SCHEDULE_ENABLED:
+            awareness_block = await self._build_awareness_block(
+                owner, source_conn, prompt_history
+            )
+        if self.life is not None and self.life.available:
+            context_feed_text, pending_life_ids = await self._build_life_feed(owner)
+        return {
+            "state_block": state_block,
+            "owner_block": owner_block,
+            "awareness_block": awareness_block,
+            "context_feed": context_feed_text,
+            "pending_life_ids": pending_life_ids,
+            "prompt_profile": prompt_profile,
+        }
+
+    async def _build_awareness_block(
+        self,
+        owner: str,
+        source_conn: Connection | None,
+        prompt_history: list[dict],
+    ) -> str:
+        """Bounded awareness block (plan section 21.1); deterministic."""
+        owner_tz = (
+            (source_conn.timezone if source_conn else "") or self.config.OWNER_TIMEZONE
+        )
+        now = datetime.now(timezone.utc)
+        owner_local = now.astimezone(self._resolve_zone(owner_tz))
+        character_local = now.astimezone(self._resolve_zone(self.config.CHARACTER_TIMEZONE))
+        schedule_now = ""
+        if self.schedule is not None and self.schedule.available:
+            block = self.schedule.current_block(now)
+            schedule_now = (
+                f"{block.get('activity')} at {block.get('place')} "
+                f"({block.get('availability')})"
+            )
+        since = ""
+        if prompt_history:
+            try:
+                last_ts = datetime.fromisoformat(prompt_history[-1]["ts"])
+                delta = max(0, int((now - last_ts).total_seconds()))
+                if delta >= 60:
+                    hours, minutes = divmod(delta // 60, 60)
+                    since = f"{hours}h {minutes}m" if hours else f"{minutes}m"
+            except (ValueError, TypeError, KeyError):
+                since = ""
+        owner_schedule_now = ""
+        if self.user_schedule.available:
+            owner_block_now = await self.user_schedule.current_block(owner, now)
+            if owner_block_now is not None:
+                state = owner_block_now.get("state", "unknown")
+                span = (
+                    f" ({owner_block_now.get('start')}-{owner_block_now.get('end')})"
+                    if owner_block_now.get("start")
+                    else ""
+                )
+                owner_schedule_now = f"{state}{span}"
+        return build_awareness_block(
+            owner_local=owner_local.strftime("%A %H:%M (%Z)"),
+            character_local=character_local.strftime("%A %H:%M (%Z)"),
+            character_schedule_now=schedule_now,
+            since_last_conversation=since,
+            owner_schedule_now=owner_schedule_now,
+        )
+
+    async def _build_life_feed(self, owner: str) -> tuple[str, list[str]]:
+        """Bounded life context feed (plan sections 20.4, 21.2)."""
+        events = await self.life.recent(owner, limit=8)
+        pending_ids = await self.life.pending_ids(owner)
+        feed, included = build_context_feed(
+            life_events=events,
+            pending_ids=pending_ids,
+            max_tokens=self.config.CONTEXT_FEED_MAX_TOKENS,
+        )
+        return feed, [rid for rid in included if rid]
+
+    async def _maybe_catchup(
+        self, owner: str, trigger_conn: Connection | None = None
+    ) -> bool:
+        """Guarded catch-up entry point; never raises."""
+        if not (
+            self.config.SCHEDULE_ENABLED
+            and self.schedule is not None
+            and self.schedule.available
+        ):
+            return False
+        try:
+            return await self.run_catchup(owner, trigger_conn=trigger_conn)
+        except Exception:  # noqa: BLE001 - maintenance never fails callers
+            log.debug("catch-up attempt failed", exc_info=True)
+            return False
+
+    async def run_catchup(
+        self, owner: str, *, trigger_conn: Connection | None = None
+    ) -> bool:
+        """Answer all held companion messages with one response (plan 16.3).
+
+        Claims entries atomically under the catch-up lock, then mutates
+        history under the per-owner turn lock. Entries restore to ``held``
+        on generation or delivery failure (unless expired). Success means
+        source delivery plus delivered-history persistence; only then are
+        claimed entries removed and the busy window reset.
+        """
+        async with self.connections.catchup_lock(owner):
+            if self.connections.turn_lock(owner).locked():
+                return False  # a turn is active; a later trigger retries
+            availability = await self._effective_availability(owner)
+            if availability not in ("free", "soft_busy"):
+                return False
+            now_ts = time.time()
+            entries = await self.deferred.claim(owner, "companion", now_ts)
+            if not entries:
+                if await self.deferred.busy_count(owner):
+                    await self.deferred.reset_busy(owner)
+                return False
+            conns = self.connections.connections_for(owner)
+            target = None
+            if trigger_conn is not None:
+                target = next(
+                    (c for c in conns if c.connection_id == trigger_conn.connection_id),
+                    None,
+                )
+            if target is None:
+                target = conns[0] if conns else None
+            if target is None:
+                await self.deferred.restore(owner, entries, now_ts)
+                return False
+
+            await target.send_json(status_frame("thinking"))
+            language = (
+                await self._owner_preferred_language() or self.config.DEFAULT_LANGUAGE
+            )
+            delivered = False
+            assistant_row: dict = {}
+            segments: list[dict] = []
+            try:
+                async with self.connections.turn_lock(owner):
+                    # Persist the held user rows (deduplicated) so the thread
+                    # reflects the owner's messages, fanning each out.
+                    existing_ids = {
+                        row.get("id")
+                        for row in await hist.load_rows(self.cache, owner)
+                    }
+                    batch_ids: set[str] = set()
+                    for entry in entries:
+                        batch_ids.add(entry["message_id"])
+                        if entry["message_id"] in existing_ids:
+                            continue
+                        row = {
+                            "id": entry["message_id"],
+                            "role": "user",
+                            "text": entry["text"],
+                            "emotion": DEFAULT_EMOTION,
+                            "ts": datetime.fromtimestamp(
+                                float(entry.get("created_ts", now_ts)),
+                                tz=timezone.utc,
+                            ).isoformat(),
+                            "delivery_state": hist.DELIVERED,
+                        }
+                        await hist.append_row(
+                            self.cache, owner, row, self.config.MAX_HISTORY_TURNS
+                        )
+                        await self._fan_out(
+                            owner,
+                            self._chat_sync(
+                                row, "user", None, origin=entry.get(
+                                    "source_connection_id"
+                                )
+                            ),
+                        )
+                    prompt_history = await hist.load_prompt_history(
+                        self.cache,
+                        owner,
+                        self.config.LLM_HISTORY_MESSAGE_BUDGET,
+                        exclude_ids=batch_ids,
+                    )
+                    blocks = await self._build_prompt_blocks(
+                        owner, source_conn=target, prompt_history=prompt_history
+                    )
+                    # Boundary classification for held texts runs now, inside
+                    # the history lock (deferred paths never classify).
+                    if self.owner_profile.available and (
+                        self.config.OWNER_BOUNDARY_PENALTIES_ENABLED
+                    ):
+                        for entry in entries:
+                            try:
+                                await self.owner_profile.record_boundary(
+                                    owner, entry["text"], language
+                                )
+                            except Exception:  # noqa: BLE001
+                                log.debug("boundary classification failed",
+                                          exc_info=True)
+                    if self.bids.available:
+                        try:
+                            await self.bids.satisfy_open_bids(
+                                owner, " ".join(e["text"] for e in entries)
+                            )
+                        except Exception:  # noqa: BLE001
+                            log.debug("bid satisfaction failed", exc_info=True)
+
+                    messages = build_catchup_prompt(
+                        soul_text=self._read_identity("soul"),
+                        profile_text=self._read_identity("profile"),
+                        history=prompt_history,
+                        held_messages=[entry["text"] for entry in entries],
+                        language=language,
+                        state_block=blocks["state_block"],
+                        owner_block=blocks["owner_block"],
+                        awareness_block=blocks["awareness_block"],
+                        context_feed=blocks["context_feed"],
+                    )
+                    result = await self.llm.chat("companion", messages)
+                    segments = parse_emotion_segments(result.text)
+                    if not _has_spoken_text(segments):
+                        try:
+                            retry = await self.llm.chat("companion", messages)
+                            result = self._merge_usage(result, retry)
+                            segments = parse_emotion_segments(retry.text)
+                        except LLMChainExhausted:
+                            pass
+                    if not _has_spoken_text(segments):
+                        raise LLMChainExhausted("empty catch-up reply")
+
+                    reply_text = join_segments(segments)
+                    assistant_row = hist.make_row(
+                        "assistant", reply_text, hist.PENDING,
+                        emotion=segments[0]["emotion"],
+                    )
+                    await hist.append_row(
+                        self.cache, owner, assistant_row, self.config.MAX_HISTORY_TURNS
+                    )
+                    done = {
+                        "type": "done",
+                        "id": assistant_row["id"],
+                        "text": reply_text,
+                        "emotion": assistant_row["emotion"],
+                        "segments": [dict(s) for s in segments],
+                        "mode": "companion",
+                        "provider": result.provider,
+                        "model": result.model,
+                        "initiated_by": "character",
+                        "catchup": True,
+                    }
+                    if result.usage:
+                        done["tokens"] = {
+                            "prompt": result.usage.get("prompt_tokens", 0),
+                            "completion": result.usage.get("completion_tokens", 0),
+                            "total": result.usage.get("total_tokens", 0),
+                        }
+                    delivered = await target.send_json(done)
+                    if delivered:
+                        await hist.mark_delivery_state(
+                            self.cache, owner, assistant_row["id"], hist.DELIVERED
+                        )
+                        await self._fan_out(
+                            owner,
+                            self._chat_sync(assistant_row, "character", target),
+                            exclude=target,
+                        )
+                        if self.needs.available:
+                            try:
+                                await self.needs.turn_effects(
+                                    owner, classify_turn_kind(reply_text)
+                                )
+                            except Exception:  # noqa: BLE001
+                                log.debug("needs turn effects failed", exc_info=True)
+                        if self.owner_profile.available:
+                            try:
+                                await self.owner_profile.apply_status_drift(owner)
+                            except Exception:  # noqa: BLE001
+                                log.debug("status drift failed", exc_info=True)
+                        delivered_pending = [
+                            rid for rid in blocks["pending_life_ids"] if rid
+                        ]
+                        if delivered_pending:
+                            try:
+                                await self.life.clear_pending(owner, delivered_pending)
+                            except Exception:  # noqa: BLE001
+                                log.debug("pending life clear failed", exc_info=True)
+                    else:
+                        await hist.mark_delivery_state(
+                            self.cache, owner, assistant_row["id"], hist.UNDELIVERED
+                        )
+            except LLMChainExhausted:
+                log.warning("Catch-up generation failed; entries restored to held")
+                await self.deferred.restore(owner, entries, time.time())
+                return False
+            if delivered:
+                await self.deferred.remove(owner, [entry["id"] for entry in entries])
+                await self.deferred.reset_busy(owner)
+                log.info(
+                    "Catch-up delivered one answer for %d held message(s)",
+                    len(entries),
+                )
+            else:
+                await self.deferred.restore(owner, entries, time.time())
+            return delivered
+
     async def run_companion_turn(
         self,
         *,
@@ -706,6 +1173,20 @@ class Bridge:
         soft_block = await self._maybe_soft_block(owner, language, source_conn)
         if soft_block is not None:
             return soft_block
+
+        # Plan 12 steps 6-7: character schedule and effective availability.
+        # Busy/unavailable messages defer into the bounded queue without an
+        # LLM call or history write; the first message in a busy window may
+        # speak the authored static line (plan section 16.3).
+        availability = await self._effective_availability(owner)
+        if availability in ("busy", "unavailable"):
+            return await self._defer_turn(
+                owner,
+                text=text,
+                language=language,
+                source_conn=source_conn,
+                availability=availability,
+            )
 
         # Status frames go to the source connection only; status emotions
         # never become final reply emotions (plan section 10.4).
@@ -751,50 +1232,38 @@ class Bridge:
                 exclude_id=user_row["id"],
             )
 
-            # Plan 12 steps 15-16: needs evaluation, state expression, and
-            # the owner lived profile block. First behavior turn materializes
-            # the profile record (plan 18.7).
-            state_block = ""
-            owner_block = ""
-            prompt_profile: dict | None = None
-            if self.needs.available:
-                snapshot = await self.needs.evaluate(owner)
-                if self.config.STATE_EXPRESSION_ENABLED:
-                    state_block = build_state_block(
-                        snapshot["zones"], self._read_identity("state")
-                    )
-            if self.owner_profile.available:
-                if (
-                    self.config.OWNER_BOUNDARY_PENALTIES_ENABLED
-                ):
-                    try:
-                        await self.owner_profile.record_boundary(owner, text, language)
-                    except Exception:  # noqa: BLE001
-                        log.debug("boundary classification failed", exc_info=True)
-                prompt_profile = await self.owner_profile.get(owner)
-                if prompt_profile is None:
-                    prompt_profile = await self.owner_profile.upsert(
-                        owner,
-                        default_profile(self.config),
-                        expected_version=1,
-                    ) or default_profile(self.config)
-                if self.config.OWNER_PROFILE_INJECT:
-                    blocked_now = bool(
-                        self.config.OWNER_SOFT_BLOCK_ENABLED
-                        and prompt_profile.get("soft_blocked")
-                    )
-                    owner_block = owner_relationship_block(
-                        prompt_profile, soft_blocked=blocked_now
-                    )
+            # Plan 12 step 16: deterministic boundary classification for the
+            # live owner message (deferred texts classify at catch-up).
+            if self.owner_profile.available and (
+                self.config.OWNER_BOUNDARY_PENALTIES_ENABLED
+            ):
+                try:
+                    await self.owner_profile.record_boundary(owner, text, language)
+                except Exception:  # noqa: BLE001
+                    log.debug("boundary classification failed", exc_info=True)
 
+            # Plan 12 steps 14-16 + identity layer 5: shared block building
+            # (needs, owner profile, awareness, bounded context feed).
+            blocks = await self._build_prompt_blocks(
+                owner, source_conn=source_conn, prompt_history=prompt_history
+            )
+            prompt_profile = blocks["prompt_profile"]
+
+            soft_busy_note = (
+                availability == "soft_busy"
+                and self.config.SCHEDULE_SOFT_BUSY_POLICY == "short"
+            )
             messages = build_companion_prompt(
                 soul_text=self._read_identity("soul"),
                 profile_text=self._read_identity("profile"),
                 history=prompt_history,
                 current_text=text.strip(),
                 language=language,
-                state_block=state_block,
-                owner_block=owner_block,
+                state_block=blocks["state_block"],
+                owner_block=blocks["owner_block"],
+                awareness_block=blocks["awareness_block"],
+                context_feed=blocks["context_feed"],
+                soft_busy_note=soft_busy_note,
             )
 
             wants_analysis = bool(
@@ -900,6 +1369,16 @@ class Bridge:
                         await self.owner_profile.apply_status_drift(owner)
                     except Exception:  # noqa: BLE001
                         log.debug("status drift failed", exc_info=True)
+                # Plan 12 step 34: clear delivered pending life mentions only
+                # after a successful response that received the context.
+                delivered_pending = [
+                    rid for rid in blocks["pending_life_ids"] if rid
+                ]
+                if delivered_pending:
+                    try:
+                        await self.life.clear_pending(owner, delivered_pending)
+                    except Exception:  # noqa: BLE001
+                        log.debug("pending life clear failed", exc_info=True)
             else:
                 # Undelivered: excluded from future prompts, no fanout (12.28).
                 await hist.mark_delivery_state(
@@ -923,6 +1402,16 @@ class Bridge:
         # step 31). The done frame always precedes audio chunks (10.6).
         if wants_audio and delivered and source_conn is not None:
             await self._stream_tts(source_conn, assistant_row["id"], segments)
+
+        # Plan 16.3: availability may have just freed; answer any held
+        # companion messages once, outside the turn lock, under the
+        # catch-up lock.
+        if delivered and self.schedule is not None and self.schedule.available:
+            catchup_task = asyncio.create_task(
+                self._maybe_catchup(owner, trigger_conn=source_conn)
+            )
+            self.background_tasks.add(catchup_task)
+            catchup_task.add_done_callback(self.background_tasks.discard)
         return done
 
     def _start_profile_analysis(
@@ -1084,7 +1573,11 @@ class Bridge:
         return second
 
     def _chat_sync(
-        self, row: dict, initiated_by: str, source_conn: Connection | None
+        self,
+        row: dict,
+        initiated_by: str,
+        source_conn: Connection | None,
+        origin: str | None = None,
     ) -> dict:
         return {
             "type": "chat_sync",
@@ -1095,7 +1588,8 @@ class Bridge:
             "initiated_by": initiated_by,
             "id": row["id"],
             "origin_connection_id": (
-                source_conn.connection_id if source_conn is not None else "http"
+                origin
+                or (source_conn.connection_id if source_conn is not None else "http")
             ),
             "ts": row["ts"],
         }
@@ -1112,6 +1606,15 @@ class Bridge:
 
     async def shutdown(self) -> None:
         """Cancel and await background tasks (plan section 6.1)."""
+        if self._life_task is not None:
+            if self._life_stop is not None:
+                self._life_stop.set()
+            self._life_task.cancel()
+            try:
+                await self._life_task
+            except asyncio.CancelledError:
+                pass
+            self._life_task = None
         for task in list(self.background_tasks):
             task.cancel()
         if self.background_tasks:
