@@ -3,19 +3,33 @@
 - ``connection_id -> Connection`` and ``owner user_id -> connection ids``.
 - Connecting a new device never closes an existing connection.
 - Disconnect removes exactly one connection and resolves pending futures.
-- Companion turns serialize on one per-owner lock shared across devices.
+- Companion turns serialize on one per-owner lock shared across devices;
+  work turns serialize on one per-session lock (plan section 11).
 - Heartbeats are never blocked on the turn lock.
+- Pending MCP/device requests are one-time, connection-bound, run-bound;
+  disconnect fails all of a connection's pending futures.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
 log = logging.getLogger("bridge.connections")
+
+
+@dataclass
+class PendingRequest:
+    """One awaited MCP/device tool result (plan sections 10.11, 10.12)."""
+
+    future: asyncio.Future
+    run_id: str
+    connection_id: str
+    kind: str  # "mcp" | "device"
 
 
 @dataclass
@@ -29,7 +43,17 @@ class Connection:
     device_id: str = ""
     timezone: str = ""
     last_heartbeat_sequence: int = -1
+    last_activity_ts: float = field(default_factory=time.monotonic)
+    # Device-daemon arming (plan section 26). Reconnect starts disarmed
+    # because these are connection-local defaults.
+    device_armed: bool = False
+    device_level: str = ""  # "read" | "full"
+    device_roots: list[str] = field(default_factory=list)
+    device_protocol_version: int = 0
     send_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+    def touch(self) -> None:
+        self.last_activity_ts = time.monotonic()
 
     async def send_json(self, frame: dict) -> bool:
         """Send a frame; returns a delivery boolean (plan section 12 step 26)."""
@@ -53,7 +77,8 @@ class ConnectionManager:
         self._turn_locks: dict[str, asyncio.Lock] = {}
         self._profile_locks: dict[str, asyncio.Lock] = {}
         self._catchup_locks: dict[str, asyncio.Lock] = {}
-        self._pending: dict[str, asyncio.Future] = {}
+        self._session_locks: dict[str, asyncio.Lock] = {}
+        self._pending: dict[str, PendingRequest] = {}
 
     def connect(
         self,
@@ -88,9 +113,11 @@ class ConnectionManager:
             ids.discard(connection_id)
             if not ids:
                 del self._by_user[conn.user_id]
-        for request_id, future in list(self._pending.items()):
-            if not future.done():
-                future.cancel()
+        for request_id, pending in list(self._pending.items()):
+            if pending.connection_id != connection_id:
+                continue
+            if not pending.future.done():
+                pending.future.cancel()
             del self._pending[request_id]
         log.info("Disconnected %s (user=%s)", connection_id, conn.user_id)
 
@@ -130,6 +157,14 @@ class ConnectionManager:
             self._catchup_locks[user_id] = lock
         return lock
 
+    def session_lock(self, session_id: str) -> asyncio.Lock:
+        """Work turns serialize per session (plan sections 11, 25.2)."""
+        lock = self._session_locks.get(session_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._session_locks[session_id] = lock
+        return lock
+
     async def fan_out(
         self, user_id: str, frame: dict, exclude_connection_id: str | None = None
     ) -> int:
@@ -146,17 +181,37 @@ class ConnectionManager:
                 delivered += 1
         return delivered
 
-    # Pending in-process futures (MCP/device routing arrives in later
-    # milestones; the lifecycle contract exists now per section 11).
-    def add_pending(self, request_id: str, future: asyncio.Future) -> None:
-        self._pending[request_id] = future
+    # Pending MCP/device requests (plan sections 10.11, 10.12): one-time,
+    # connection-bound, run-bound, removed on success/timeout/disconnect.
+    def add_pending(
+        self, request_id: str, future: asyncio.Future, meta: dict
+    ) -> None:
+        self._pending[request_id] = PendingRequest(
+            future=future,
+            run_id=str(meta.get("run_id") or ""),
+            connection_id=str(meta.get("connection_id") or ""),
+            kind=str(meta.get("kind") or ""),
+        )
+
+    def pending_meta(self, request_id: str) -> dict | None:
+        pending = self._pending.get(request_id)
+        if pending is None:
+            return None
+        return {
+            "run_id": pending.run_id,
+            "connection_id": pending.connection_id,
+            "kind": pending.kind,
+        }
 
     def resolve_pending(self, request_id: str, result: Any) -> bool:
-        future = self._pending.pop(request_id, None)
-        if future is None or future.done():
+        pending = self._pending.pop(request_id, None)
+        if pending is None or pending.future.done():
             return False
-        future.set_result(result)
+        pending.future.set_result(result)
         return True
+
+    def drop_pending(self, request_id: str) -> None:
+        self._pending.pop(request_id, None)
 
     def pending_count(self) -> int:
         return len(self._pending)

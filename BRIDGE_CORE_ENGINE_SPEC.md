@@ -2,8 +2,8 @@
 
 Living implementation contract. It refines unspecified details of
 `BRIDGE_CORE_ENGINE_IMPLEMENTATION_PLAN.md`; it may not override locked
-decisions (plan section 2). Milestones implemented: **0.1.0**, **0.2.0**,
-**0.3.0**, **0.4.0**.
+decisions (plan section 2). Milestones implemented: **0.1.0** through
+**0.5.0**.
 
 ## Deviations from the plan
 
@@ -31,6 +31,10 @@ decisions (plan section 2). Milestones implemented: **0.1.0**, **0.2.0**,
   `life_events/schema_example.disabled.json` (`enabled: false` — it
   establishes no backstory); `LIFE_EVENTS_DIR` points at author-supplied
   template directories.
+  Milestone 0.5.0 adds `core/sessions.py`, `core/mcp.py`, `core/device.py`,
+  `core/agent_runs.py`, `core/work_tools.py`, and `core/routes/sessions.py`;
+  `skills/WORK_SKILLS.md` stays at the plan-layout path
+  (`WORK_SKILLS_FILE` overrides).
 - **Implementation-specific env fields** (allowed by plan 8.3, documented
   here): `LIFE_SKIP_ACTIVITIES` (comma-separated block activities whose
   entries never generate life events; default `sleep`) and
@@ -38,6 +42,26 @@ decisions (plan section 2). Milestones implemented: **0.1.0**, **0.2.0**,
   leaves soft_busy reply length to "configured policy"). Owner and character
   timezones (`OWNER_TIMEZONE`, `CHARACTER_TIMEZONE`) must be valid IANA
   names and fail startup otherwise (plan 16.2).
+- **Work decisions (0.5.0)**, refining unspecified plan details:
+  - The critical-shutdown "emergency-work override" (plan 25.1) has no
+    env field in the section 8.3 inventory, so it is not implemented;
+    critical needs shutdown defers work like `unavailable`.
+  - `device_write` content size cap reuses `DEVICE_MAX_OUTPUT_CHARS`
+    (the plan says "configured write cap" without naming a variable).
+  - MCP write-vs-read classification for verification uses tool-name
+    heuristics (write/create/edit/... vs read/list/check/...); device
+    tools classify structurally (`device_write`/`device_shell` are
+    writes, `device_read`/`list`/`stat`/`find` are checks/reads).
+  - Work catch-up entries deferred **without** session metadata are
+    answered but not persisted into any session history (there is no
+    default work channel); entries carrying a session id write into that
+    session's history key.
+  - A deferred work message with an explicit archived/unknown session id
+    still defers; session resolution at catch-up treats a missing
+    session as no-session context.
+  - The paused-work status frame carries the bounded pause text (clamped
+    to 200 chars) in its `message` field — the only channel, because a
+    pause sends no `done` frame (plan 30.2).
 - **Voice profile "repeat variations"**: plan 14.1 lists "repeat variations"
   among voice-profile fields. The ElevenLabs chat-completions-era TTS API used
   here has no such parameter, so it is not implemented; the profile schema
@@ -60,8 +84,8 @@ decisions (plan section 2). Milestones implemented: **0.1.0**, **0.2.0**,
   `done` that will not come (plan section 30.2).
 - Unknown `mode` values → terminal `unknown_mode` error frame, never silent
   companion fallback. `mode: "work"` → terminal `work_unavailable` error
-  frame; work mode ships in milestone 0.5.0. This applies to both `text` and
-  `audio` frames.
+  frame when the work flags are off; work mode itself ships in milestone
+  0.5.0. This applies to both `text` and `audio` frames.
 - Empty/whitespace `text` → terminal `empty_input` error frame; no LLM call
   and no history write (plan section 12 step 3).
 - Explicit `language` outside {en, es, ja} → terminal `unsupported_language`
@@ -588,6 +612,125 @@ integration tests):
 - Usage in 0.4.0: awareness context only. Initiative gating and daily-tool
   access arrive with their milestones.
 
+## Milestone 0.5.0 — work mode and device daemon
+
+### Work turns (plan sections 12 step 10, 25.1, 25.2)
+
+- `mode: "work"` is accepted on text and audio frames and `POST /message`
+  when `WORK_ENABLED` and `SESSIONS_ENABLED` are on; otherwise the
+  terminal `work_unavailable` error stands. HTTP-originated work turns
+  are tool-less by design (no originating WS connection holds execution
+  authority, plan 10.10).
+- Work availability policy: `free`/`soft_busy` proceed; `busy`/`unavailable`
+  defer into the bounded queue with `mode: "work"` (same ladder and
+  static-line rules as companion); critical needs shutdown defers work
+  (no emergency override exists). The relationship soft block never
+  blocks work — verified by integration tests. Mood/relationship blocks
+  are excluded from work prompts entirely; work quality is not degraded
+  by companion state (plan 25.1).
+- Sessions: resolution order explicit `session_id` → latest active for
+  `project_id` → auto-create; explicit archived/unknown ids are terminal
+  `session_error`s; archived sessions never auto-resume. Work history
+  lives at `core:history:{owner}:session:{session_id}` with the same row
+  schema and delivery-state machine as companion history; the channels
+  are never mixed (covered by tests).
+- Work turns serialize per session (plan section 11). The user row
+  persists before any provider/tool activity; assistant rows follow the
+  same pending → delivered/undelivered protocol; `chat_sync` fanout uses
+  `mode: "work"`.
+- Work prompts: SOUL.md + PROFILE.md + `skills/WORK_SKILLS.md` + session
+  context (summary, project) + awareness + an honest `[TOOLS]`
+  availability note + structural work laws. The final-reply emotion
+  contract applies to work synthesis; only `[STATUS: question]` /
+  `[STATUS: request_permission]` may replace the emotion tag as a pause.
+
+### Agent loop, verification, checkpoints (plan sections 25.4-25.7)
+
+- OpenAI-style loop: assistant tool-call arrays, one `tool` response per
+  call, bounded by `MCP_MAX_ITERATIONS`; the iteration limit triggers one
+  no-tools synthesis (`[AGENT LIMIT]` note). The first successful
+  provider/model is pinned for the loop and unpinned on failure (plan
+  9.3); usage is additive across iterations.
+- Execution authority: only tools in the current turn's registry
+  (`context.mcp_servers` plus device tools from armed connections) are
+  callable; anything else returns a structured `unknown_tool` failure.
+  Invalid-argument JSON is a structured failure, never a Python
+  exception.
+- Verification (`MCP_VERIFICATION_ENABLED`): successful writes with no
+  later read/check touching the same tool or path trigger a bounded
+  forced follow-up (`MCP_VERIFICATION_RETRIES`), instructing the model to
+  verify or state clearly what remains unverified. Unverified writes are
+  recorded in the run checkpoint.
+- Checkpoints (`AGENT_CHECKPOINTS_ENABLED`): one record per session at
+  `core:agent_run:{owner}:{session_id}` — run id, state
+  (running/paused/completed/failed/interrupted/resumed), iteration,
+  bounded metadata-only evidence, last error, bounded transcript tail.
+  Stale run ids never overwrite a newer run.
+
+### Pause protocol (plan sections 25.6, 30.2)
+
+- `[STATUS: question]` / `[STATUS: request_permission]` parse before
+  emotion validation. A pause sends no `done`; the source connection gets
+  a status frame carrying the bounded pause text (≤ 200 chars), and the
+  run checkpoint plus a durable pending record
+  (`core:pending_agent:{owner}:{session}:{run_id}`) are stored.
+- Resume: the next owner answer resumes only when it explicitly supplies
+  the same `session_id` + `run_id`; the stored loop transcript restores
+  context and the state becomes `resumed` → `completed`. Any device may
+  resume (the answer is not connection-bound).
+- Disconnect converts a connection-only pending pause to `interrupted`
+  while keeping the durable recovery checkpoint recoverable.
+
+### MCP proxy (plan sections 10.11, 25.3)
+
+- `context.mcp_servers` (bounded 16 servers × 64 tools) is the only
+  execution authority. Schema-rich tools expose `mcp__<server>__<tool>`
+  with the exact input schema; legacy servers expose one generic
+  `mcp__<server>__call` wrapper taking `{tool, arguments}`.
+- Requests route only to the originating connection; results correlate
+  strictly by id + `run_id` + connection. One result resolves one future
+  and deletes the `core:mcp_response:{owner}:{request_id}` backup;
+  duplicate/stale/wrong-connection results are ignored with bounded
+  logs. Timeout yields a structured failed tool result so the loop
+  continues or reports failure.
+
+### Device daemon (plan section 26)
+
+- `device_state` arms a connection at `read` or `full` with explicit
+  roots (protocol version 1 required). Reconnect starts disarmed
+  (connection-local state) and disconnect invalidates that connection's
+  pending requests.
+- Requests route to armed owner connections supporting the required
+  level, most recently active first. Server-side fences: version-1
+  schemas reject unknown fields; `device_write`/`device_shell` require
+  full level; secret patterns (env files, SSH/cloud/browser/keychain/
+  token paths) are rejected before sending; advisory root containment;
+  shell argv/shell_command mutual exclusion; environment filtered to an
+  allowlist; per-turn call caps (`DEVICE_PER_TURN_CALL_CAP`) and output
+  caps (`DEVICE_MAX_OUTPUT_CHARS`) bound every request. The client must
+  independently enforce its own fences; the server is the second layer.
+- Results are one-time, connection-bound, run-bound, deleted after
+  consumption (`core:device_response:{owner}:{request_id}`). The audit
+  ring `core:device:audit:{owner}` (≤ 100 entries) stores metadata only:
+  tool, bounded path/command preview, ok flag, duration, timestamp —
+  never output text or file content.
+- Device tools are offered in the work prompt only when an armed
+  connection exists; offline state is stated honestly and nothing queues.
+
+### Work deferral and catch-up (plan section 16.3)
+
+- Work messages defer into the same bounded queue with `mode: "work"`
+  and, when supplied, the original `session_id`. Companion catch-up
+  claims only companion entries; work catch-up claims only work entries
+  (separate claim filters, same per-owner catch-up lock).
+- Work catch-up is text-only and tool-less: entries are grouped by their
+  original session; the group's answer uses work voice, writes user rows
+  (deduplicated) plus the assistant row into that session's history, and
+  the `done` carries `catchup: true`, `mode: "work"`, and the session id
+  when present. Entries without session metadata are answered but not
+  persisted into any session history. Failures restore the group to
+  `held` (expired entries drop).
+
 ## Testing contract
 
 - `tests/fakes.py::FakeRedis` implements the exact async subset
@@ -611,7 +754,7 @@ integration tests):
   requests and replay scripted responses.
 - HTTP+WS tests use FastAPI's `TestClient`; no network, no live Redis.
 
-## Redis keys in 0.1.0–0.4.0
+## Redis keys in 0.1.0–0.5.0
 
 `core:history:{owner}:companion` (list of JSON rows: `id`, `role`, `text`,
 `emotion`, `ts`, `delivery_state`) is the only key a flags-off deployment
@@ -624,7 +767,15 @@ and polls. With 0.3.0 flags enabled, the single-document keys
 (LIFE_ENABLED), `core:deferred:{owner}` (document; absent when empty) and
 `core:busy_count:{owner}` (SCHEDULE_ENABLED defers), and
 `core:user_schedule:{owner}` / `core:user_schedule:day:{owner}:{ymd}`
-(USER_SCHEDULE_ENABLED writes). **Audio is never stored server-side** —
+(USER_SCHEDULE_ENABLED writes). With 0.5.0 work flags on (work defaults
+ON): `core:sessions:{owner}`, `core:projects:{owner}`,
+`core:history:{owner}:session:{session_id}`,
+`core:agent_run:{owner}:{session_id}`,
+`core:pending_agent:{owner}:{session}:{run_id}` (24h-expiry checked),
+`core:mcp_response:{owner}:{request_id}` /
+`core:device_response:{owner}:{request_id}` (deleted after consumption),
+and `core:device:audit:{owner}` (metadata only; `DEVICE_ENABLED`).
+**Audio is never stored server-side** —
 audio bytes exist only in flight, and the STT/TTS paths write no keys. All
 other keys in plan section 28 belong to later milestones.
 

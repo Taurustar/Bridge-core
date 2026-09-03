@@ -43,6 +43,7 @@ class LLMResult:
     model: str
     usage: dict[str, int] | None
     attempts: int
+    tool_calls: list[dict] | None = None  # normalized OpenAI-style calls
 
 
 def normalize_base_url(url: str) -> str:
@@ -134,9 +135,23 @@ class LLMRouter:
 
     # -- calling ---------------------------------------------------------------
 
-    async def chat(self, mode: str, messages: list[dict]) -> LLMResult:
-        routes = self.routes_for(mode)
-        if not routes:
+    async def chat(
+        self,
+        mode: str,
+        messages: list[dict],
+        tools: list[dict] | None = None,
+        pinned: ProviderRoute | None = None,
+    ) -> LLMResult:
+        """One routed chat call.
+
+        ``tools`` carries OpenAI function schemas; when given, tool calls
+        come back on the result instead of failing validation. ``pinned``
+        restricts the chain to one already-successful route (tool loops pin
+        the first successful provider per plan 9.3); if that route fails
+        the exception propagates and the caller may unpin.
+        """
+        routes = [pinned] if pinned is not None else self.routes_for(mode)
+        if not routes or routes[0] is None:
             raise LLMChainExhausted(f"No LLM routes configured for mode {mode!r}")
 
         deadline = time.monotonic() + self._config.LLM_CHAIN_DEADLINE_SECONDS
@@ -162,8 +177,8 @@ class LLMRouter:
                 continue
             attempts += 1
             try:
-                text, usage = await self._call_provider(
-                    route, settings, messages, mode, remaining
+                text, usage, tool_calls = await self._call_provider(
+                    route, settings, messages, mode, remaining, tools
                 )
             except Exception as exc:  # noqa: BLE001 - failover boundary
                 log.warning(
@@ -184,6 +199,7 @@ class LLMRouter:
                 model=route.model,
                 usage=total_usage if saw_usage else None,
                 attempts=attempts,
+                tool_calls=tool_calls,
             )
 
         raise LLMChainExhausted(
@@ -197,7 +213,8 @@ class LLMRouter:
         messages: list[dict],
         mode: str,
         budget_seconds: float,
-    ) -> tuple[str, dict[str, int] | None]:
+        tools: list[dict] | None = None,
+    ) -> tuple[str, dict[str, int] | None, list[dict] | None]:
         cfg = self._config
         body: dict[str, Any] = {
             "model": route.model,
@@ -205,6 +222,9 @@ class LLMRouter:
             "temperature": getattr(cfg, f"{mode.upper()}_TEMPERATURE", 0.8),
             "max_tokens": getattr(cfg, f"{mode.upper()}_MAX_TOKENS", 1200),
         }
+        if tools:
+            body["tools"] = tools
+            body["tool_choice"] = "auto"
         if settings["service_tier"]:
             body["service_tier"] = settings["service_tier"]
 
@@ -215,7 +235,6 @@ class LLMRouter:
         timeout = settings["timeout"]
         if timeout is None or timeout > budget_seconds:
             timeout = max(budget_seconds, 0.001)
-
         response = await self._client.post(
             f"{settings['url']}/chat/completions",
             json=body,
@@ -223,10 +242,13 @@ class LLMRouter:
             timeout=timeout,
         )
         response.raise_for_status()
-        return self._parse_response(response)
+        content, usage, tool_calls = self._parse_response(response)
+        return content, usage, tool_calls
 
     @staticmethod
-    def _parse_response(response: httpx.Response) -> tuple[str, dict[str, int] | None]:
+    def _parse_response(
+        response: httpx.Response,
+    ) -> tuple[str, dict[str, int] | None, list[dict] | None]:
         """Validation contract of plan section 9.2 — never assume shapes."""
         try:
             data = response.json()
@@ -244,6 +266,7 @@ class LLMRouter:
             else:
                 error_message = str(error_obj)
             raise RuntimeError(f"LLM provider error: {error_message}")
+
         if not isinstance(choices, list):
             raise RuntimeError("LLM provider error: choices is not a list")
 
@@ -253,9 +276,35 @@ class LLMRouter:
         message = first.get("message")
         if not isinstance(message, dict):
             raise RuntimeError("LLM provider error: missing message object")
+
+        raw_calls = message.get("tool_calls")
+        tool_calls: list[dict] | None = None
+        if isinstance(raw_calls, list) and raw_calls:
+            tool_calls = []
+            for call in raw_calls:
+                if not isinstance(call, dict):
+                    continue
+                function = call.get("function")
+                if not isinstance(function, dict):
+                    continue
+                tool_calls.append(
+                    {
+                        "id": str(call.get("id") or f"call_{len(tool_calls)}"),
+                        "type": "function",
+                        "name": str(function.get("name") or ""),
+                        "arguments": str(function.get("arguments") or "{}"),
+                    }
+                )
+            if not tool_calls:
+                tool_calls = None
+
         content = message.get("content")
         if not isinstance(content, str) or not content.strip():
-            raise RuntimeError("LLM provider error: empty content")
+            # Tool-call turns may legitimately carry no prose.
+            if tool_calls:
+                content = ""
+            else:
+                raise RuntimeError("LLM provider error: empty content")
 
         usage: dict[str, int] | None = None
         raw_usage = data.get("usage")
@@ -266,4 +315,4 @@ class LLMRouter:
                 if isinstance(value, int) and not isinstance(value, bool):
                     usage[key] = value
 
-        return content, usage
+        return content, usage, tool_calls

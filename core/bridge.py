@@ -38,6 +38,7 @@ import base64
 import json
 import logging
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -46,6 +47,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from fastapi import WebSocket, WebSocketDisconnect
 
 from . import history as hist
+from .agent_runs import checkpoint_from_result, run_agent_loop
 from .bids import BidsEngine
 from .cache import RedisCache
 from .config import Config
@@ -55,15 +57,21 @@ from .constants import (
     HEARTBEAT_MAX_AGE_SECONDS,
     HEARTBEAT_MAX_FUTURE_SECONDS,
     INITIATIVE_COUNTER_STUB,
+    PAUSE_STATUSES,
+    RUN_STATES,
     STATUS_TO_EMOTION,
     SUPPORTED_LANGUAGES,
     VERSION,
+    agent_run_key,
+    pending_agent_key,
 )
 from .context_feed import build_awareness_block, build_context_feed
+from .device import DeviceManager
 from .emotions import load_emotions_manifest
 from .interaction import DeferredQueue
 from .life import LifeEngine
 from .llm import LLMChainExhausted, LLMResult, LLMRouter
+from .mcp import MCPProxy, parse_tool_name
 from .memory import LongTermMemory
 from .needs import NeedsEngine, classify_turn_kind
 from .owner_profile import (
@@ -77,9 +85,13 @@ from .prompts import (
     build_catchup_prompt,
     build_companion_prompt,
     build_owner_profile_analysis_prompt,
+    build_session_summary_prompt,
+    build_work_catchup_prompt,
+    build_work_prompt,
 )
 from .rhythm import RhythmEngine
 from .schedule import Schedule
+from .sessions import SessionError, SessionStore
 from .speech import (
     AudioValidationError,
     SpeechProviderError,
@@ -91,8 +103,15 @@ from .speech import (
 )
 from .state_expression import build_state_block
 from .static_lines import get_static_line, load_static_lines
-from .text_utils import chunk_segments, join_segments, parse_emotion_segments
+from .text_utils import (
+    chunk_segments,
+    join_segments,
+    parse_emotion_segments,
+    parse_pause_status,
+    strip_pause_tags,
+)
 from .user_schedule import UserSchedule
+from .work_tools import WorkToolRegistry
 
 log = logging.getLogger("bridge.turn")
 
@@ -175,6 +194,9 @@ class Bridge:
         self.deferred = DeferredQueue(config, cache)
         self.user_schedule = UserSchedule(config, cache)
         self.longterm = LongTermMemory(config, cache)
+        self.sessions = SessionStore(config, cache)
+        self.mcp = MCPProxy(config, cache, self.connections)
+        self.device = DeviceManager(config, cache, self.connections)
         self.schedule: Schedule | None = None
         self.life: LifeEngine | None = None
         self.emotions_manifest: dict = {}
@@ -186,6 +208,10 @@ class Bridge:
         self._last_bid_sweep = 0.0
         self._life_task: asyncio.Task | None = None
         self._life_stop: asyncio.Event | None = None
+        # In-process index of pending work pauses (run_id -> connection),
+        # so disconnect can convert connection-only pauses to interrupted
+        # while the durable checkpoint stays recoverable (plan 25.6).
+        self._pending_pauses: dict[str, dict] = {}
 
     # -- startup -------------------------------------------------------------
 
@@ -235,6 +261,12 @@ class Bridge:
         if self.stt.available():
             caps.append("voice_input")
         caps.extend(["heartbeat", "chat_sync"])
+        if self.config.WORK_ENABLED and self.config.SESSIONS_ENABLED:
+            caps.append("work")
+            if self.config.MCP_PROXY_ENABLED:
+                caps.append("mcp")
+            if self.config.DEVICE_ENABLED:
+                caps.append("device")
         return caps
 
     def feature_summary(self) -> dict[str, bool]:
@@ -338,6 +370,17 @@ class Bridge:
             pass
         finally:
             self.connections.disconnect(conn.connection_id)
+            # Plan 25.6: a connection-only pending pause becomes
+            # interrupted, but the durable checkpoint stays recoverable
+            # via explicit session/run ids.
+            for run_id, meta in list(self._pending_pauses.items()):
+                if meta.get("connection_id") != conn.connection_id:
+                    continue
+                interrupt_task = asyncio.create_task(
+                    self._mark_run_interrupted(conn.user_id, meta["session_id"], run_id)
+                )
+                self.background_tasks.add(interrupt_task)
+                interrupt_task.add_done_callback(self.background_tasks.discard)
 
     async def _handle_inbound(self, conn: Connection, raw: str) -> None:
         try:
@@ -350,6 +393,7 @@ class Bridge:
             return
 
         frame_type = frame.get("type")
+        conn.touch()
         if frame_type == "heartbeat":
             await self.handle_heartbeat(conn, frame)
         elif frame_type == "text":
@@ -361,6 +405,16 @@ class Bridge:
             # the history APIs milestone; acknowledgements are accepted and
             # idempotently ignored in 0.1.0 (documented in SPEC).
             log.debug("message_ack ignored (no pending reconciliation)")
+        elif frame_type == "mcp_result":
+            self.mcp.handle_result(conn, frame)
+        elif frame_type == "device_tool_result":
+            self.device.handle_result(conn, frame)
+        elif frame_type == "device_state":
+            error_code = self.device.apply_state(conn, frame)
+            if error_code is not None:
+                await conn.send_json(
+                    error_frame(error_code, "Invalid device_state frame.")
+                )
         else:
             await conn.send_json(
                 error_frame("unknown_frame_type", f"Unknown frame type: {frame_type!r}")
@@ -395,21 +449,22 @@ class Bridge:
 
     async def _handle_text_frame(self, conn: Connection, frame: dict) -> None:
         mode = frame.get("mode", "companion")
-        if mode == "work":
-            # Work mode ships in milestone 0.5.0 (documented in SPEC).
+        if mode not in ("companion", "work"):
             await conn.send_json(
                 error_frame(
-                    "work_unavailable",
-                    "Work mode is not available in this build.",
+                    "unknown_mode",
+                    f"Unknown mode: {mode!r}. Supported: companion, work.",
                     terminal=True,
                 )
             )
             return
-        if mode != "companion":
+        if mode == "work" and not (
+            self.config.WORK_ENABLED and self.config.SESSIONS_ENABLED
+        ):
             await conn.send_json(
                 error_frame(
-                    "unknown_mode",
-                    f"Unknown mode: {mode!r}. Supported: companion.",
+                    "work_unavailable",
+                    "Work mode is not available on this server.",
                     terminal=True,
                 )
             )
@@ -432,17 +487,37 @@ class Bridge:
         text = frame.get("text")
         wants_audio = bool(frame.get("wants_audio"))
         # Run the turn in a background task so the reader loop keeps serving
-        # heartbeats and other frames while the turn holds the owner lock.
-        task = asyncio.create_task(
-            self.run_companion_turn(
-                text=text if isinstance(text, str) else "",
-                language=language,
-                source_conn=conn,
-                wants_audio=wants_audio,
+        # heartbeats, tool results, and other frames while the turn runs.
+        if mode == "work":
+            session_id = frame.get("session_id")
+            project_id = frame.get("project_id")
+            run_task = asyncio.create_task(
+                self.run_work_turn(
+                    text=text if isinstance(text, str) else "",
+                    language=language,
+                    source_conn=conn,
+                    wants_audio=wants_audio,
+                    session_id=session_id if isinstance(session_id, str) else None,
+                    project_id=project_id if isinstance(project_id, str) else None,
+                    context=frame.get("context")
+                    if isinstance(frame.get("context"), dict)
+                    else None,
+                    explicit_run_id=frame.get("run_id")
+                    if isinstance(frame.get("run_id"), str)
+                    else None,
+                )
             )
-        )
-        self.background_tasks.add(task)
-        task.add_done_callback(self.background_tasks.discard)
+        else:
+            run_task = asyncio.create_task(
+                self.run_companion_turn(
+                    text=text if isinstance(text, str) else "",
+                    language=language,
+                    source_conn=conn,
+                    wants_audio=wants_audio,
+                )
+            )
+        self.background_tasks.add(run_task)
+        run_task.add_done_callback(self.background_tasks.discard)
 
     # -- audio (voice input) turns (plan sections 10.3, 14.2, 14.3) -----------
 
@@ -455,20 +530,22 @@ class Bridge:
 
     async def _handle_audio_frame(self, conn: Connection, frame: dict) -> None:
         mode = frame.get("mode", "companion")
-        if mode == "work":
+        if mode not in ("companion", "work"):
             await conn.send_json(
                 error_frame(
-                    "work_unavailable",
-                    "Work mode is not available in this build.",
+                    "unknown_mode",
+                    f"Unknown mode: {mode!r}. Supported: companion, work.",
                     terminal=True,
                 )
             )
             return
-        if mode != "companion":
+        if mode == "work" and not (
+            self.config.WORK_ENABLED and self.config.SESSIONS_ENABLED
+        ):
             await conn.send_json(
                 error_frame(
-                    "unknown_mode",
-                    f"Unknown mode: {mode!r}. Supported: companion.",
+                    "work_unavailable",
+                    "Work mode is not available on this server.",
                     terminal=True,
                 )
             )
@@ -568,6 +645,24 @@ class Bridge:
             return
 
         wants_audio = bool(frame.get("wants_audio"))
+        if mode == "work":
+            work_task = asyncio.create_task(
+                self.run_work_turn(
+                    text=transcript,
+                    language=language,
+                    source_conn=conn,
+                    wants_audio=wants_audio,
+                    session_id=frame.get("session_id")
+                    if isinstance(frame.get("session_id"), str)
+                    else None,
+                    project_id=frame.get("project_id")
+                    if isinstance(frame.get("project_id"), str)
+                    else None,
+                )
+            )
+            self.background_tasks.add(work_task)
+            work_task.add_done_callback(self.background_tasks.discard)
+            return
         task = asyncio.create_task(
             self.run_companion_turn(
                 text=transcript,
@@ -681,6 +776,13 @@ class Bridge:
                 )
                 self.background_tasks.add(catchup_task)
                 catchup_task.add_done_callback(self.background_tasks.discard)
+                work_catchup_task = asyncio.create_task(
+                    self._maybe_work_catchup(conn.user_id, trigger_conn=conn)
+                )
+                self.background_tasks.add(work_catchup_task)
+                work_catchup_task.add_done_callback(
+                    self.background_tasks.discard
+                )
 
     async def _sweep_bids(self, owner_id: str) -> None:
         try:
@@ -763,32 +865,37 @@ class Bridge:
         language: str,
         source_conn: Connection | None,
         availability: str,
+        mode: str = "companion",
+        session_id: str | None = None,
     ) -> dict:
         """Busy/unavailable ladder (plan section 16.3).
 
-        The message is queued for one later catch-up answer; no LLM call, no
-        history write, no bids/needs effects run on this path. The first
+        The message is queued for one later catch-up answer; no LLM call,
+        no history write, no bids/needs effects run on this path. The first
         message in a busy window may speak the authored static line;
         repeated messages defer protocol-only. Skipped hooks (do not run):
         bids, needs effects, boundary classification (classified at
-        catch-up), history persistence, memory/analysis.
+        catch-up), history persistence, memory/analysis. Work entries keep
+        their session metadata so work catch-up stays separated (plan
+        16.3).
         """
-        user_row = hist.make_row("user", text.strip(), hist.DELIVERED)
+        user_row = hist.make_row("user", text.strip(), hist.DELIVERED, mode=mode)
         origin = source_conn.connection_id if source_conn is not None else "http"
         async with self.connections.catchup_lock(owner):
             window_count = await self.deferred.busy_count(owner)
             await self.deferred.append(
                 owner,
                 message_id=user_row["id"],
-                mode="companion",
+                mode=mode,
                 text=text.strip(),
                 source_connection_id=origin,
+                session_id=session_id,
             )
             await self.deferred.increment_busy(owner)
         done: dict[str, Any] = {
             "type": "done",
             "id": hist.new_message_id(),
-            "mode": "companion",
+            "mode": mode,
             "emotion": DEFAULT_EMOTION,
             "ignored": True,
             "reason": availability,
@@ -803,7 +910,8 @@ class Bridge:
         if source_conn is not None:
             await source_conn.send_json(done)
         log.info(
-            "Companion message deferred (availability=%s, window_count=%d)",
+            "%s message deferred (availability=%s, window_count=%d)",
+            mode.capitalize(),
             availability,
             window_count,
         )
@@ -1146,6 +1254,766 @@ class Bridge:
                 await self.deferred.restore(owner, entries, time.time())
             return delivered
 
+    # -- work mode (plan sections 25, 26, 11) --------------------------------------
+
+    def _work_skills_path(self) -> Path:
+        override = self.config.WORK_SKILLS_FILE.strip()
+        if override:
+            return Path(override)
+        return REPO_ROOT / "skills" / "WORK_SKILLS.md"
+
+    def _read_file_cached(self, path: Path) -> str:
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            return ""
+        cached = self._identity_cache.get(f"file:{path}")
+        if cached and cached[0] == mtime:
+            return cached[1]
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            return ""
+        self._identity_cache[f"file:{path}"] = (mtime, text)
+        return text
+
+    def _work_skills_text(self) -> str:
+        if not self.config.WORK_SKILLS_ENABLED:
+            return ""
+        return self._read_file_cached(self._work_skills_path())
+
+    def _session_context(self, owner: str, session: dict | None) -> str:
+        if session is None:
+            return ""
+        lines = [
+            f"[WORK SESSION] id: {session.get('id')}",
+            f"Session status: {session.get('status')}",
+        ]
+        if session.get("summary"):
+            lines.append(f"Previous summary: {str(session['summary'])[:500]}")
+        project_id = session.get("project_id") or ""
+        if project_id:
+            lines.append(f"Project: {project_id}")
+            return "\n".join(lines)
+        return "\n".join(lines)
+
+    def _device_level_for(self, owner: str) -> str:
+        """Device tools are offered only when an armed connection exists
+        (plan section 26.6); the prompt states availability honestly."""
+        if not self.config.DEVICE_ENABLED:
+            return ""
+        if self.device.armed_connections(owner, "full"):
+            return "full"
+        if self.device.armed_connections(owner, "read"):
+            return "read"
+        return ""
+
+    async def _write_checkpoint(
+        self,
+        owner: str,
+        session_id: str,
+        *,
+        run_id: str,
+        state: str,
+        loop=None,
+        last_error: str = "",
+        started_ts: float = 0.0,
+    ) -> None:
+        """Bounded run/checkpoint record; stale run ids never overwrite
+        newer runs (plan section 25.7)."""
+        if not self.config.AGENT_CHECKPOINTS_ENABLED:
+            return
+        record = checkpoint_from_result(
+            run_id=run_id,
+            session_id=session_id,
+            state=state if state in RUN_STATES else "failed",
+            loop=loop,
+            last_error=last_error,
+        )
+        record["started_ts"] = started_ts or record["updated_ts"]
+        key = agent_run_key(owner, session_id)
+        existing_raw = await self.cache.get_value(key)
+        if existing_raw:
+            try:
+                existing = json.loads(existing_raw)
+                if (
+                    existing.get("run_id") != run_id
+                    and float(existing.get("started_ts", 0) or 0)
+                    > record["started_ts"]
+                ):
+                    return  # stale run id
+            except (json.JSONDecodeError, TypeError, ValueError):
+                pass
+        await self.cache.set_value(key, json.dumps(record))
+
+    async def _store_pending_pause(
+        self,
+        owner: str,
+        session_id: str,
+        run_id: str,
+        status_tag: str,
+        source_conn: Connection | None,
+        transcript: list[dict],
+    ) -> None:
+        payload = json.dumps(
+            transcript[-12:], ensure_ascii=False, default=str
+        )[:8000]
+        record = {
+            "run_id": run_id,
+            "session_id": session_id,
+            "status": status_tag,
+            "connection_id": source_conn.connection_id if source_conn else "",
+            "created_ts": time.time(),
+            "expires_ts": time.time() + 24 * 3600,
+            "transcript": payload,
+        }
+        await self.cache.set_value(
+            pending_agent_key(owner, session_id, run_id), json.dumps(record)
+        )
+        if source_conn is not None:
+            self._pending_pauses[run_id] = {
+                "session_id": session_id,
+                "connection_id": source_conn.connection_id,
+            }
+
+    async def _read_pending_pause(
+        self, owner: str, session_id: str, run_id: str
+    ) -> dict | None:
+        raw = await self.cache.get_value(
+            pending_agent_key(owner, session_id, run_id)
+        )
+        if not raw:
+            return None
+        try:
+            record = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(record, dict):
+            return None
+        if float(record.get("expires_ts", 0) or 0) < time.time():
+            await self.cache.delete(pending_agent_key(owner, session_id, run_id))
+            return None
+        return record
+
+    async def _clear_pending_pause(
+        self, owner: str, session_id: str, run_id: str
+    ) -> None:
+        await self.cache.delete(pending_agent_key(owner, session_id, run_id))
+        self._pending_pauses.pop(run_id, None)
+
+    async def _mark_run_interrupted(
+        self, owner: str, session_id: str, run_id: str
+    ) -> None:
+        """Disconnect converts a connection-only pending pause into
+        interrupted; the durable checkpoint remains recoverable (25.6)."""
+        self._pending_pauses.pop(run_id, None)
+        key = agent_run_key(owner, session_id)
+        raw = await self.cache.get_value(key)
+        if not raw:
+            return
+        try:
+            record = json.loads(raw)
+        except json.JSONDecodeError:
+            return
+        if record.get("run_id") == run_id and record.get("state") == "paused":
+            record["state"] = "interrupted"
+            record["updated_ts"] = time.time()
+            await self.cache.set_value(key, json.dumps(record))
+            log.info("Run %s marked interrupted after disconnect", run_id[:16])
+
+    async def run_work_turn(
+        self,
+        *,
+        text: str,
+        language: str,
+        source_conn: Connection | None,
+        wants_audio: bool = False,
+        session_id: str | None = None,
+        project_id: str | None = None,
+        context: dict | None = None,
+        explicit_run_id: str | None = None,
+    ) -> dict:
+        """One work-mode turn (plan sections 25.1, 25.4, 25.6).
+
+        Serializes per session (plan section 11). Work bypasses the
+        relationship soft block by design (plan 12 step 5); mood blocks are
+        excluded so companion state cannot degrade work quality. Tool
+        execution routes only to the originating WS connection (MCP) or an
+        armed owner connection (device); HTTP-originated turns get no
+        tools.
+        """
+        owner = self.config.OWNER_USER_ID
+        if not (self.config.WORK_ENABLED and self.config.SESSIONS_ENABLED):
+            frame = error_frame(
+                "work_unavailable",
+                "Work mode is not available on this server.",
+                terminal=True,
+            )
+            if source_conn is not None:
+                await source_conn.send_json(frame)
+            return frame
+        if not text.strip():
+            frame = error_frame(
+                "empty_input", "Message text must not be empty.", terminal=True
+            )
+            if source_conn is not None:
+                await source_conn.send_json(frame)
+            return frame
+
+        # Plan 25.1 work availability policy (soft block never applies).
+        availability = await self._effective_availability(owner)
+        if availability in ("busy", "unavailable"):
+            return await self._defer_turn(
+                owner,
+                text=text,
+                language=language,
+                source_conn=source_conn,
+                availability=availability,
+                mode="work",
+                session_id=session_id,
+            )
+
+        try:
+            session, _created = await self.sessions.resolve(
+                owner, session_id=session_id, project_id=project_id
+            )
+        except SessionError as exc:
+            frame = error_frame("session_error", str(exc), terminal=True)
+            if source_conn is not None:
+                await source_conn.send_json(frame)
+            return frame
+
+        session_id_resolved = session["id"]
+        history_key = hist.session_history_key(owner, session_id_resolved)
+        run_id = explicit_run_id or f"run_{uuid.uuid4().hex}"
+        started_ts = time.time()
+        resumed_record = None
+        if explicit_run_id:
+            resumed_record = await self._read_pending_pause(
+                owner, session_id_resolved, run_id
+            )
+
+        lock = self.connections.session_lock(session_id_resolved)
+        done: dict[str, Any]
+        async with lock:
+            if source_conn is not None:
+                await source_conn.send_json(status_frame("working"))
+            # Persist the user row before any provider/tool activity.
+            user_row = hist.make_row(
+                "user", text.strip(), hist.DELIVERED, mode="work"
+            )
+            await hist.append_row_to(
+                self.cache, history_key, user_row, self.config.SESSION_HISTORY_TURNS
+            )
+            await self._fan_out(
+                owner,
+                self._chat_sync(user_row, "user", source_conn, mode="work"),
+                exclude=source_conn,
+            )
+            prompt_history = await hist.load_prompt_history(
+                self.cache,
+                owner,
+                self.config.SESSION_HISTORY_TURNS,
+                key=history_key,
+            )
+
+            device_level = self._device_level_for(owner)
+            registry = WorkToolRegistry.build(
+                context=context,
+                device_level=device_level,
+                max_chars=self.config.DEVICE_MAX_OUTPUT_CHARS,
+                shell_timeout_max=self.config.DEVICE_SHELL_TIMEOUT_MAX,
+            )
+            turn_calls: list[str] = []
+
+            async def executor(name: str, arguments: dict) -> dict:
+                if not registry.has_tools or name not in registry.known:
+                    return {
+                        "ok": False, "error": "unknown_tool", "result": None,
+                        "truncated": False,
+                    }
+                if name.startswith("mcp__"):
+                    if source_conn is None:
+                        return {
+                            "ok": False, "error": "tools_require_websocket",
+                            "result": None, "truncated": False,
+                        }
+                    parsed = parse_tool_name(name)
+                    if parsed is None:
+                        return {
+                            "ok": False, "error": "invalid_tool_name",
+                            "result": None, "truncated": False,
+                        }
+                    server, tool = parsed
+                    return await self.mcp.call(
+                        owner,
+                        run_id=run_id,
+                        source_conn=source_conn,
+                        server=server,
+                        tool=tool,
+                        arguments=arguments,
+                        turn_calls=turn_calls,
+                    )
+                return await self.device.call(
+                    owner,
+                    run_id=run_id,
+                    tool=name,
+                    arguments=arguments,
+                    turn_calls=turn_calls,
+                )
+
+            if resumed_record is not None:
+                try:
+                    messages = json.loads(
+                        resumed_record.get("transcript") or "[]"
+                    )
+                except json.JSONDecodeError:
+                    messages = []
+                if not isinstance(messages, list) or not messages:
+                    messages = build_work_prompt(
+                        soul_text=self._read_identity("soul"),
+                        profile_text=self._read_identity("profile"),
+                        skills_text=self._work_skills_text(),
+                        history=prompt_history,
+                        current_text=text.strip(),
+                        language=language,
+                        session_context=self._session_context(owner, session),
+                        tools_note=registry.availability_note(),
+                    )
+                else:
+                    messages.append({"role": "user", "content": text.strip()})
+                log.info("Resuming paused run %s", run_id[:16])
+            else:
+                messages = build_work_prompt(
+                    soul_text=self._read_identity("soul"),
+                    profile_text=self._read_identity("profile"),
+                    skills_text=self._work_skills_text(),
+                    history=prompt_history,
+                    current_text=text.strip(),
+                    language=language,
+                    session_context=self._session_context(owner, session),
+                    tools_note=registry.availability_note(),
+                )
+
+            await self._write_checkpoint(
+                owner,
+                session_id_resolved,
+                run_id=run_id,
+                state="running",
+                loop=None,
+                started_ts=started_ts,
+            )
+
+            try:
+                loop = await run_agent_loop(
+                    self.llm,
+                    messages=messages,
+                    registry=registry,
+                    executor=executor,
+                    max_iterations=(
+                        self.config.MCP_MAX_ITERATIONS
+                        if registry.has_tools
+                        else 1
+                    ),
+                    verification_enabled=(
+                        self.config.MCP_VERIFICATION_ENABLED
+                        and registry.has_tools
+                    ),
+                    verification_retries=self.config.MCP_VERIFICATION_RETRIES,
+                )
+            except LLMChainExhausted:
+                log.error("Work turn failed: LLM chain exhausted")
+                await self._write_checkpoint(
+                    owner,
+                    session_id_resolved,
+                    run_id=run_id,
+                    state="failed",
+                    loop=None,
+                    last_error="llm_chain_exhausted",
+                    started_ts=started_ts,
+                )
+                frame = error_frame(
+                    "llm_unavailable",
+                    "No LLM provider could produce a reply.",
+                    terminal=True,
+                )
+                if source_conn is not None:
+                    await source_conn.send_json(frame)
+                return frame
+
+            pause_tag = _parse_pause_status(loop.text)
+            if pause_tag:
+                paused_text = _strip_pause_tags(loop.text).strip()
+                await self._store_pending_pause(
+                    owner,
+                    session_id_resolved,
+                    run_id,
+                    pause_tag,
+                    source_conn,
+                    loop.transcript,
+                )
+                await self._write_checkpoint(
+                    owner,
+                    session_id_resolved,
+                    run_id=run_id,
+                    state="paused",
+                    loop=loop,
+                    started_ts=started_ts,
+                )
+                await self.sessions.update(
+                    owner, session_id_resolved, last_run_id=run_id
+                )
+                if source_conn is not None:
+                    # No done frame on pause (plan 30.2); the status frame
+                    # carries the bounded question text.
+                    await source_conn.send_json(
+                        status_frame(pause_tag, message=paused_text[:200])
+                    )
+                return {
+                    "type": "paused",
+                    "session_id": session_id_resolved,
+                    "run_id": run_id,
+                    "status": pause_tag,
+                    "message": paused_text[:200],
+                }
+
+            segments = parse_emotion_segments(loop.text)
+            if not _has_spoken_text(segments):
+                try:
+                    retry_messages = [
+                        dict(message) for message in loop.transcript
+                    ]
+                    retry = await self.llm.chat(
+                        "work", retry_messages, pinned=None
+                    )
+                    loop.text = retry.text
+                    loop.attempts += retry.attempts
+                    if retry.usage:
+                        for key, value in retry.usage.items():
+                            loop.usage[key] = loop.usage.get(key, 0) + value
+                    segments = parse_emotion_segments(retry.text)
+                except LLMChainExhausted:
+                    pass
+            if not _has_spoken_text(segments):
+                log.error("Work turn failed: empty reply after retry")
+                await self._write_checkpoint(
+                    owner,
+                    session_id_resolved,
+                    run_id=run_id,
+                    state="failed",
+                    loop=loop,
+                    last_error="empty_reply",
+                    started_ts=started_ts,
+                )
+                frame = error_frame(
+                    "empty_reply",
+                    "The provider returned an empty reply.",
+                    terminal=True,
+                )
+                if source_conn is not None:
+                    await source_conn.send_json(frame)
+                return frame
+
+            reply_text = join_segments(segments)
+            emotion = segments[0]["emotion"]
+            assistant_row = hist.make_row(
+                "assistant", reply_text, hist.PENDING,
+                emotion=emotion, mode="work",
+            )
+            await hist.append_row_to(
+                self.cache, history_key, assistant_row,
+                self.config.SESSION_HISTORY_TURNS,
+            )
+            done = {
+                "type": "done",
+                "id": assistant_row["id"],
+                "text": reply_text,
+                "emotion": emotion,
+                "segments": [dict(segment) for segment in segments],
+                "mode": "work",
+                "provider": loop.provider,
+                "model": loop.model,
+                "session_id": session_id_resolved,
+                "run_id": run_id,
+                "initiated_by": "user",
+            }
+            if loop.usage:
+                done["tokens"] = {
+                    "prompt": loop.usage.get("prompt_tokens", 0),
+                    "completion": loop.usage.get("completion_tokens", 0),
+                    "total": loop.usage.get("total_tokens", 0),
+                }
+            if source_conn is not None:
+                delivered = await source_conn.send_json(done)
+            else:
+                delivered = True
+            if delivered:
+                await hist.mark_delivery_state_key(
+                    self.cache, history_key, assistant_row["id"], hist.DELIVERED
+                )
+                await self._fan_out(
+                    owner,
+                    self._chat_sync(assistant_row, "character", source_conn,
+                                    mode="work"),
+                )
+                await self._write_checkpoint(
+                    owner,
+                    session_id_resolved,
+                    run_id=run_id,
+                    state="completed",
+                    loop=loop,
+                    started_ts=started_ts,
+                )
+                await self._clear_pending_pause(
+                    owner, session_id_resolved, run_id
+                )
+                await self.sessions.update(
+                    owner, session_id_resolved, last_run_id=run_id
+                )
+            else:
+                await hist.mark_delivery_state_key(
+                    self.cache, history_key, assistant_row["id"], hist.UNDELIVERED
+                )
+                await self._write_checkpoint(
+                    owner,
+                    session_id_resolved,
+                    run_id=run_id,
+                    state="failed",
+                    loop=loop,
+                    last_error="delivery_failed",
+                    started_ts=started_ts,
+                )
+            log.info(
+                "Work turn completed: session=%s run=%s iterations=%d "
+                "tool_calls=%d delivered=%s",
+                session_id_resolved,
+                run_id[:16],
+                loop.iterations,
+                loop.tool_calls_made,
+                delivered,
+            )
+
+        if wants_audio and delivered and source_conn is not None:
+            await self._stream_tts(source_conn, done["id"], segments)
+        if delivered:
+            work_catchup = asyncio.create_task(
+                self._maybe_work_catchup(owner, trigger_conn=source_conn)
+            )
+            self.background_tasks.add(work_catchup)
+            work_catchup.add_done_callback(self.background_tasks.discard)
+        return done
+
+    async def _maybe_work_catchup(
+        self, owner: str, trigger_conn: Connection | None = None
+    ) -> bool:
+        if not (
+            self.config.SCHEDULE_ENABLED
+            and self.schedule is not None
+            and self.schedule.available
+            and self.config.WORK_ENABLED
+            and self.config.SESSIONS_ENABLED
+        ):
+            return False
+        try:
+            return await self.run_work_catchup(owner, trigger_conn=trigger_conn)
+        except Exception:  # noqa: BLE001 - maintenance never fails callers
+            log.debug("work catch-up attempt failed", exc_info=True)
+            return False
+
+    async def run_work_catchup(
+        self, owner: str, *, trigger_conn: Connection | None = None
+    ) -> bool:
+        """Text-only, tool-less work catch-up (plan section 16.3).
+
+        Claims work entries separately from companion entries, groups them
+        by original session, and answers each group once in work voice
+        tied to the original session/project metadata. Failures restore
+        that group's entries to held.
+        """
+        async with self.connections.catchup_lock(owner):
+            availability = await self._effective_availability(owner)
+            if availability not in ("free", "soft_busy"):
+                return False
+            now_ts = time.time()
+            entries = await self.deferred.claim(owner, "work", now_ts)
+            if not entries:
+                return False
+            session_id = entries[0].get("session_id") or ""
+            group = [
+                entry
+                for entry in entries
+                if (entry.get("session_id") or "") == session_id
+            ]
+            others = [entry for entry in entries if entry not in group]
+            if others:
+                # Deliver one session group per trigger; the rest stay
+                # claimed for the next pass only if delivered here —
+                # otherwise restore everything together.
+                pass
+            conns = self.connections.connections_for(owner)
+            target = None
+            if trigger_conn is not None:
+                target = next(
+                    (
+                        c
+                        for c in conns
+                        if c.connection_id == trigger_conn.connection_id
+                    ),
+                    None,
+                )
+            if target is None:
+                target = conns[0] if conns else None
+            if target is None:
+                await self.deferred.restore(owner, entries, now_ts)
+                return False
+
+            session = (
+                await self.sessions.get(owner, session_id) if session_id else None
+            )
+            history_key = (
+                hist.session_history_key(owner, session["id"])
+                if session
+                else None
+            )
+            delivered = False
+            try:
+                if session is not None:
+                    async with self.connections.session_lock(session["id"]):
+                        delivered = await self._deliver_work_catchup(
+                            owner,
+                            entries=group,
+                            session=session,
+                            history_key=history_key,
+                            target=target,
+                            language=(
+                                await self._owner_preferred_language()
+                                or self.config.DEFAULT_LANGUAGE
+                            ),
+                        )
+                else:
+                    delivered = await self._deliver_work_catchup(
+                        owner,
+                        entries=group,
+                        session=None,
+                        history_key=None,
+                        target=target,
+                        language=(
+                            await self._owner_preferred_language()
+                            or self.config.DEFAULT_LANGUAGE
+                        ),
+                    )
+            except LLMChainExhausted:
+                log.warning("Work catch-up generation failed; entries restored")
+                delivered = False
+            if delivered:
+                await self.deferred.remove(owner, [e["id"] for e in group])
+                if others:
+                    await self.deferred.restore(owner, others, time.time())
+                log.info(
+                    "Work catch-up delivered for %d held message(s)", len(group)
+                )
+            else:
+                await self.deferred.restore(owner, entries, time.time())
+            return delivered
+
+    async def _deliver_work_catchup(
+        self,
+        owner: str,
+        *,
+        entries: list[dict],
+        session: dict | None,
+        history_key: str | None,
+        target: Connection,
+        language: str,
+    ) -> bool:
+        messages = build_work_catchup_prompt(
+            soul_text=self._read_identity("soul"),
+            profile_text=self._read_identity("profile"),
+            skills_text=self._work_skills_text(),
+            session_context=self._session_context(owner, session),
+            held_messages=[entry["text"] for entry in entries],
+            language=language,
+        )
+        result = await self.llm.chat("work", messages)
+        segments = parse_emotion_segments(result.text)
+        if not _has_spoken_text(segments):
+            retry = await self.llm.chat("work", messages)
+            result = self._merge_usage(result, retry)
+            segments = parse_emotion_segments(retry.text)
+        if not _has_spoken_text(segments):
+            raise LLMChainExhausted("empty work catch-up reply")
+        reply_text = join_segments(segments)
+        assistant_row = hist.make_row(
+            "assistant", reply_text, hist.PENDING,
+            emotion=segments[0]["emotion"], mode="work",
+        )
+        max_rows = self.config.SESSION_HISTORY_TURNS
+        if history_key is not None:
+            existing_ids = {
+                row.get("id")
+                for row in await hist.load_rows_from(self.cache, history_key)
+            }
+            for entry in entries:
+                if entry["message_id"] in existing_ids:
+                    continue
+                user_row = {
+                    "id": entry["message_id"],
+                    "role": "user",
+                    "text": entry["text"],
+                    "emotion": DEFAULT_EMOTION,
+                    "mode": "work",
+                    "ts": datetime.fromtimestamp(
+                        float(entry.get("created_ts", time.time())),
+                        tz=timezone.utc,
+                    ).isoformat(),
+                    "delivery_state": hist.DELIVERED,
+                }
+                await hist.append_row_to(
+                    self.cache, history_key, user_row, max_rows
+                )
+                await self._fan_out(
+                    owner,
+                    self._chat_sync(
+                        user_row,
+                        "user",
+                        None,
+                        origin=entry.get("source_connection_id"),
+                        mode="work",
+                    ),
+                )
+            await hist.append_row_to(
+                self.cache, history_key, assistant_row, max_rows
+            )
+        done = {
+            "type": "done",
+            "id": assistant_row["id"],
+            "text": reply_text,
+            "emotion": assistant_row["emotion"],
+            "segments": [dict(segment) for segment in segments],
+            "mode": "work",
+            "provider": result.provider,
+            "model": result.model,
+            "initiated_by": "character",
+            "catchup": True,
+        }
+        if session is not None:
+            done["session_id"] = session["id"]
+        delivered = await target.send_json(done)
+        if delivered and history_key is not None:
+            await hist.mark_delivery_state_key(
+                self.cache, history_key, assistant_row["id"], hist.DELIVERED
+            )
+            await self._fan_out(
+                owner,
+                self._chat_sync(assistant_row, "character", target, mode="work"),
+                exclude=target,
+            )
+        elif not delivered and history_key is not None:
+            await hist.mark_delivery_state_key(
+                self.cache, history_key, assistant_row["id"], hist.UNDELIVERED
+            )
+        return delivered
+
     async def run_companion_turn(
         self,
         *,
@@ -1405,13 +2273,18 @@ class Bridge:
 
         # Plan 16.3: availability may have just freed; answer any held
         # companion messages once, outside the turn lock, under the
-        # catch-up lock.
+        # catch-up lock. Held work entries get their own text-only pass.
         if delivered and self.schedule is not None and self.schedule.available:
             catchup_task = asyncio.create_task(
                 self._maybe_catchup(owner, trigger_conn=source_conn)
             )
             self.background_tasks.add(catchup_task)
             catchup_task.add_done_callback(self.background_tasks.discard)
+            work_catchup_task = asyncio.create_task(
+                self._maybe_work_catchup(owner, trigger_conn=source_conn)
+            )
+            self.background_tasks.add(work_catchup_task)
+            work_catchup_task.add_done_callback(self.background_tasks.discard)
         return done
 
     def _start_profile_analysis(
@@ -1578,13 +2451,14 @@ class Bridge:
         initiated_by: str,
         source_conn: Connection | None,
         origin: str | None = None,
+        mode: str = "companion",
     ) -> dict:
         return {
             "type": "chat_sync",
             "role": row["role"],
             "text": row["text"],
             "emotion": row.get("emotion", "neutral"),
-            "mode": "companion",
+            "mode": row.get("mode", mode),
             "initiated_by": initiated_by,
             "id": row["id"],
             "origin_connection_id": (
@@ -1627,6 +2501,16 @@ class Bridge:
 
 def _has_spoken_text(segments: list[dict]) -> bool:
     return any(str(segment.get("text", "")).strip() for segment in segments)
+
+
+def _parse_pause_status(text: str) -> str | None:
+    """Work pause tags parse before final emotion validation (25.6)."""
+    tag = parse_pause_status(text)
+    return tag if tag in PAUSE_STATUSES else None
+
+
+def _strip_pause_tags(text: str) -> str:
+    return strip_pause_tags(text)
 
 
 def _audio_complete(message_id: str, succeeded: int, failed: int) -> dict:

@@ -235,7 +235,6 @@ tags, no asterisk actions, no lists, at most two short sentences. It must be
 plausible for the place and activity given, and consistent with the identity
 files above. Do not mention the owner unless the inspiration implies them."""
 
-
 def build_life_prompt(
     *,
     template: dict,
@@ -274,3 +273,154 @@ def build_life_prompt(
         {"role": "system", "content": "\n\n".join(system_parts)},
         {"role": "user", "content": "\n".join(user_parts)},
     ]
+
+
+_WORK_LAWS = """\
+[WORK LAWS]
+- You are doing focused work with the owner. Companion mood never degrades
+  work capability; if the schedule limits capacity, say so honestly instead
+  of pretending.
+- Never claim a file was read, a command ran, or a change was written
+  unless a tool result in this conversation proves it.
+- Failed tool results are evidence of failure, not success. Report them.
+- Do not narrate tool mechanics, schemas, or provider routes in the final
+  reply; speak the outcome.
+- Media generation is unavailable; never promise it.
+"""
+
+
+def build_work_prompt(
+    *,
+    soul_text: str,
+    profile_text: str,
+    skills_text: str = "",
+    history: list[dict],
+    current_text: str,
+    language: str = "en",
+    session_context: str = "",
+    awareness_block: str = "",
+    tools_note: str = "",
+) -> list[dict]:
+    """Work-mode prompt (plan sections 25.1, 25.2).
+
+    Work voice is a capability, not a different character: identity comes
+    from SOUL.md/PROFILE.md as always, WORK_SKILLS.md adds the owner's
+    work instructions, and mood/relationship blocks are deliberately
+    excluded so companion state cannot degrade work quality.
+    """
+    system_parts: list[str] = []
+    if soul_text.strip():
+        system_parts.append(soul_text.strip())
+    if profile_text.strip():
+        system_parts.append(profile_text.strip())
+    if skills_text.strip():
+        system_parts.append(skills_text.strip())
+    if session_context.strip():
+        system_parts.append(session_context.strip())
+    if awareness_block.strip():
+        system_parts.append(awareness_block.strip())
+    if tools_note.strip():
+        system_parts.append(f"[TOOLS]\n{tools_note.strip()}")
+    system_parts.append(STRUCTURAL_LAWS.strip())
+    system_parts.append(_WORK_LAWS.strip())
+
+    messages: list[dict] = [{"role": "system", "content": "\n\n".join(system_parts)}]
+    for row in history:
+        role = row.get("role")
+        if role not in ("user", "assistant"):
+            continue
+        messages.append({"role": role, "content": str(row.get("text", ""))})
+    messages.append(
+        {
+            "role": "system",
+            "content": (
+                "[FINAL REMINDER]\n"
+                "- Begin your final reply with [EMOTION: name] on its own line, "
+                "then the spoken text.\n"
+                "- Only [STATUS: question] or [STATUS: request_permission] may "
+                "replace the emotion tag, when you must pause for the owner.\n"
+                f"- Reply in language: {language}."
+            ),
+        }
+    )
+    messages.append({"role": "user", "content": current_text})
+    return messages
+
+
+def build_session_summary_prompt(
+    *, history: list[dict], previous_summary: str = ""
+) -> list[dict]:
+    """Strict-JSON session summary (plan sections 7.2, 25.8).
+
+    Output: {"summary": "...", "project_facts": ["..."], "open_issues":
+    ["..."]}. High-level facts only; no code dumps, secrets, or
+    transcript copies.
+    """
+    bounded = history[-40:]
+    transcript = "\n".join(
+        f"{row.get('role', 'user')}: {str(row.get('text', ''))[:500]}"
+        for row in bounded
+    )
+    if len(transcript) > 8000:
+        transcript = transcript[-8000:]
+    system = (
+        "You summarize a work session for long-lived project memory. "
+        "Return STRICT JSON only, no prose, no markdown fences:\n"
+        '{"summary": "2-4 sentences, max 500 chars",\n'
+        ' "project_facts": ["durable high-level fact, max 200 chars each", ...],\n'
+        ' "open_issues": ["unresolved item", ...]}\n'
+        "Facts must be standalone and never include code, secrets, file "
+        "dumps, or verbatim dialogue. An empty session returns "
+        '{"summary": "", "project_facts": [], "open_issues": []}.'
+    )
+    user_parts = []
+    if previous_summary.strip():
+        user_parts.append(f"Previous summary:\n{previous_summary[:800]}")
+    user_parts.append(f"Session transcript:\n{transcript}")
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": "\n\n".join(user_parts)},
+    ]
+
+
+def build_work_catchup_prompt(
+    *,
+    soul_text: str,
+    profile_text: str,
+    skills_text: str = "",
+    session_context: str = "",
+    held_messages: list[str],
+    language: str = "en",
+) -> list[dict]:
+    """Text-only, tool-less work catch-up (plan section 16.3).
+
+    Uses the original session/project context when present. Never claims
+    tool execution.
+    """
+    batch = "\n---\n".join(
+        message.strip() for message in held_messages if str(message).strip()
+    )
+    messages = build_work_prompt(
+        soul_text=soul_text,
+        profile_text=profile_text,
+        skills_text=skills_text,
+        history=[],
+        current_text=batch,
+        language=language,
+        session_context=session_context,
+    )
+    messages.insert(
+        1,
+        {
+            "role": "system",
+            "content": (
+                "[CATCH-UP] The owner sent the following work request(s) "
+                "while you were unavailable. They are reproduced together "
+                "below as one batch. Answer once, in one reply. No tools "
+                "are available; if a request needs tools, say what you "
+                "will need and ask the owner to re-run it in work mode. Do "
+                "not mention queues or availability mechanics."
+            ),
+        },
+    )
+    return messages

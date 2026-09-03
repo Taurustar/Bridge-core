@@ -84,12 +84,15 @@ class DeferredQueue:
         mode: str,
         text: str,
         source_connection_id: str,
+        session_id: str | None = None,
         now_ts: float | None = None,
     ) -> dict:
         """Store one deferred message. Returns the stored entry.
 
         Oldest entries drop first when the count or total-character caps are
-        exceeded (plan section 16.3). Deduplication by message id.
+        exceeded (plan section 16.3). Deduplication by message id. Work
+        entries carry their session metadata so work catch-up stays tied to
+        the original session (plan section 16.3).
         """
         now_ts = now_ts if now_ts is not None else time.time()
         doc = await self._read(owner)
@@ -103,6 +106,7 @@ class DeferredQueue:
             "created_ts": now_ts,
             "expires_ts": now_ts + DEFERRED_TTL_SECONDS,
             "source_connection_id": source_connection_id,
+            "session_id": session_id or "",
             "state": "held",
         }
         # Dedupe by original message id, preserving arrival order (plan 16.3).

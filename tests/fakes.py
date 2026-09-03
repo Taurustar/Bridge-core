@@ -117,12 +117,13 @@ class FakeLLM:
     """Scriptable LLM router substitute.
 
     ``replies`` is a queue; each item is either a raw reply string, an
-    Exception instance to raise, or a callable awaited with
-    ``(mode, messages)`` returning a raw reply string.
+    Exception instance to raise, a callable awaited with
+    ``(mode, messages)`` returning a raw reply string, or a dict shaped
+    ``{"text": str, "tool_calls": [{"id", "name", "arguments"}]}`` for
+    tool-call scripting.
 
     ``block_gate`` is an optional ``threading.Event``: while unset, chat()
-    polls it asynchronously, simulating a provider call that is still running
-    (used to prove heartbeat acks are not blocked by an active turn).
+    polls it asynchronously, simulating a provider call that is still running.
     """
 
     def __init__(self, replies: list | None = None) -> None:
@@ -130,7 +131,13 @@ class FakeLLM:
         self.calls: list[tuple[str, list[dict]]] = []
         self.block_gate: Any = None
 
-    async def chat(self, mode: str, messages: list[dict]) -> LLMResult:
+    async def chat(
+        self,
+        mode: str,
+        messages: list[dict],
+        tools: list[dict] | None = None,
+        pinned: Any = None,
+    ) -> LLMResult:
         self.calls.append((mode, messages))
         if self.block_gate is not None:
             while not self.block_gate.is_set():
@@ -142,12 +149,17 @@ class FakeLLM:
             raise item
         if callable(item):
             item = await item(mode, messages)
+        tool_calls = None
+        if isinstance(item, dict):
+            tool_calls = item.get("tool_calls")
+            item = item.get("text", "")
         return LLMResult(
             text=item,
             provider="fake",
             model="fake-model",
             usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
             attempts=1,
+            tool_calls=tool_calls,
         )
 
     def routes_for(self, mode: str) -> list:

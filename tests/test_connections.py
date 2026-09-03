@@ -55,7 +55,7 @@ class ConnectionManagerTest(unittest.IsolatedAsyncioTestCase):
         conn = manager.connect(FakeWebSocket(), "owner")
         loop = asyncio.get_running_loop()
         future = loop.create_future()
-        manager.add_pending("mcp_1", future)
+        manager.add_pending("mcp_1", future, {"run_id": "run_1", "connection_id": conn.connection_id, "kind": "mcp"})
         self.assertEqual(manager.pending_count(), 1)
         manager.disconnect(conn.connection_id)
         self.assertEqual(manager.pending_count(), 0)
@@ -65,7 +65,7 @@ class ConnectionManagerTest(unittest.IsolatedAsyncioTestCase):
         manager = ConnectionManager()
         loop = asyncio.get_running_loop()
         future = loop.create_future()
-        manager.add_pending("mcp_1", future)
+        manager.add_pending("mcp_1", future, {"run_id": "run_1", "connection_id": "conn_x", "kind": "mcp"})
         self.assertTrue(manager.resolve_pending("mcp_1", {"ok": True}))
         self.assertEqual(await future, {"ok": True})
         # duplicate results are ignored

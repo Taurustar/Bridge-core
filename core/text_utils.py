@@ -19,6 +19,8 @@ import re
 from .constants import DEFAULT_EMOTION, FINAL_EMOTIONS
 
 _EMOTION_TAG_RE = re.compile(r"\[EMOTION:\s*([A-Za-z_]+)\s*\]")
+_PAUSE_TAG_RE = re.compile(r"\[STATUS:\s*(question|request_permission)\s*\]",
+                           re.IGNORECASE)
 _ASTERISK_RE = re.compile(r"\*[^*\n]*\*")
 # Unsupported control tags such as [STATUS: question] or [TOOL: x]. Uppercase
 # ``NAME:`` shape only, so ordinary bracketed prose like [Note: ...] survives.
@@ -109,6 +111,22 @@ def parse_emotion_reply(raw: str) -> tuple[str, str]:
     if not segments:
         return "", DEFAULT_EMOTION
     return join_segments(segments), segments[0]["emotion"]
+
+
+def parse_pause_status(raw: str) -> str | None:
+    """Extract a work pause tag (plan section 25.6).
+
+    Only ``[STATUS: question]`` and ``[STATUS: request_permission]`` are
+    valid pause tags; anything else is not a pause. Parsed before final
+    emotion validation.
+    """
+    match = _PAUSE_TAG_RE.search(raw or "")
+    return match.group(1).lower() if match else None
+
+
+def strip_pause_tags(raw: str) -> str:
+    """Remove pause tags from display/persisted text."""
+    return _PAUSE_TAG_RE.sub("", raw or "")
 
 
 def split_long_text(text: str, size: int) -> list[str]:

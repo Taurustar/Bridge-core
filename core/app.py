@@ -187,6 +187,17 @@ def create_app(
             "user_schedule": {
                 "enabled": bridge.user_schedule.available,
             },
+            "work": {
+                "enabled": bool(
+                    bridge.config.WORK_ENABLED and bridge.config.SESSIONS_ENABLED
+                ),
+                "mcp": bridge.config.MCP_PROXY_ENABLED,
+                "device": bridge.config.DEVICE_ENABLED,
+                "checkpoints": bridge.config.AGENT_CHECKPOINTS_ENABLED,
+                "armed_devices": len(bridge.device.armed_connections(
+                    bridge.config.OWNER_USER_ID, "read"
+                )),
+            },
             "connections": len(bridge.connections.connections_for(cfg.OWNER_USER_ID)),
         }
 
@@ -197,6 +208,7 @@ def create_app(
     from .routes.life import register_life_routes
     from .routes.profiles import register_profile_routes
     from .routes.schedule import register_schedule_routes
+    from .routes.sessions import register_session_routes
     from .routes.state import register_state_routes
     from .routes.user_schedule import register_user_schedule_routes
 
@@ -205,6 +217,7 @@ def create_app(
     register_schedule_routes(app, bridge)
     register_life_routes(app, bridge)
     register_user_schedule_routes(app, bridge)
+    register_session_routes(app, bridge)
 
     @app.post("/message")
     async def message(request: Request):
@@ -234,17 +247,19 @@ def create_app(
                 ),
             )
         mode = body.get("mode", "companion")
-        if mode == "work":
-            return JSONResponse(
-                status_code=400,
-                content=error_body(
-                    "work_unavailable", "Work mode is not available in this build."
-                ),
-            )
-        if mode != "companion":
+        if mode not in ("companion", "work"):
             return JSONResponse(
                 status_code=400,
                 content=error_body("unknown_mode", f"Unknown mode: {mode!r}."),
+            )
+        if mode == "work" and not (
+            bridge.config.WORK_ENABLED and bridge.config.SESSIONS_ENABLED
+        ):
+            return JSONResponse(
+                status_code=400,
+                content=error_body(
+                    "work_unavailable", "Work mode is not available on this server."
+                ),
             )
         text = body.get("text")
         if not isinstance(text, str) or not text.strip():
@@ -267,9 +282,24 @@ def create_app(
         else:
             preferred = await bridge._owner_preferred_language()
             language = preferred or bridge.config.DEFAULT_LANGUAGE
-        done = await bridge.run_companion_turn(
-            text=text, language=language, source_conn=None
-        )
+        if mode == "work":
+            # HTTP work turns are tool-less: there is no originating WS
+            # connection with execution authority (plan section 10.10).
+            done = await bridge.run_work_turn(
+                text=text,
+                language=language,
+                source_conn=None,
+                session_id=body.get("session_id")
+                if isinstance(body.get("session_id"), str)
+                else None,
+                project_id=body.get("project_id")
+                if isinstance(body.get("project_id"), str)
+                else None,
+            )
+        else:
+            done = await bridge.run_companion_turn(
+                text=text, language=language, source_conn=None
+            )
         if done.get("type") == "error":
             return JSONResponse(status_code=502, content=error_body(
                 done["error"]["code"], done["error"]["message"], done["error"]["details"]

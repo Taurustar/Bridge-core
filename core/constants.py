@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 
 # ---------------------------------------------------------------------------
 # Emotion palette (plan section 13.1). The v1 palette is fixed for wire
@@ -208,3 +208,65 @@ def user_schedule_key(owner_user_id: str) -> str:
 
 def user_schedule_day_key(owner_user_id: str, ymd: str) -> str:
     return f"core:user_schedule:day:{owner_user_id}:{ymd}"
+
+
+# ---------------------------------------------------------------------------
+# Work mode (plan sections 25, 28). Milestone 0.5.0.
+# ---------------------------------------------------------------------------
+
+def sessions_key(owner_user_id: str) -> str:
+    return f"core:sessions:{owner_user_id}"
+
+
+def projects_key(owner_user_id: str) -> str:
+    return f"core:projects:{owner_user_id}"
+
+
+def agent_run_key(owner_user_id: str, session_id: str) -> str:
+    return f"core:agent_run:{owner_user_id}:{session_id}"
+
+
+def pending_agent_key(owner_user_id: str, session_id: str, run_id: str) -> str:
+    return f"core:pending_agent:{owner_user_id}:{session_id}:{run_id}"
+
+
+def mcp_response_key(owner_user_id: str, request_id: str) -> str:
+    return f"core:mcp_response:{owner_user_id}:{request_id}"
+
+
+def device_response_key(owner_user_id: str, request_id: str) -> str:
+    return f"core:device_response:{owner_user_id}:{request_id}"
+
+
+def device_audit_key(owner_user_id: str) -> str:
+    return f"core:device:audit:{owner_user_id}"
+
+
+# Agent run states (plan section 25.7).
+RUN_STATES: tuple[str, ...] = (
+    "running",
+    "paused",
+    "completed",
+    "failed",
+    "interrupted",
+    "resumed",
+)
+
+# Work pause control tags (plan section 25.6). Parsed before emotion
+# validation; they pause without a done frame.
+PAUSE_STATUSES: tuple[str, ...] = ("question", "request_permission")
+
+# Bounded persistence helpers.
+SESSION_MAX_COUNT = 200
+AUDIT_RING_MAX = 100
+CHECKPOINT_TTL_SECONDS = 24 * 3600
+RESPONSE_BACKUP_TTL_SECONDS = 3600
+TRANSCRIPT_TAIL_CHARS = 4000
+DEVICE_MAX_LIST_ENTRIES = 1000
+DEVICE_MAX_FIND_RESULTS = 500
+DEVICE_MAX_DEPTH = 32
+DEVICE_MAX_ENV_ENTRIES = 32
+DEVICE_MAX_ARGV = 128
+DEVICE_MAX_SHELL_COMMAND_CHARS = 16000
+DEVICE_MAX_PATH_CHARS = 4096
+DEVICE_MAX_PATTERN_CHARS = 256

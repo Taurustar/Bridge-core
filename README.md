@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  <strong>Version 0.4.0</strong> — Self-hosted backend for a persistent character companion.<br>
+  <strong>Version 0.5.0</strong> — Self-hosted backend for a persistent character companion.<br>
   <em>Lightweight. General-purpose. Privacy-first.</em>
 </p>
 
@@ -220,12 +220,19 @@ core/
   memory.py               durable Redis long-term fallback (core:longterm:{owner})
   context_feed.py         awareness block + bounded context feed (PAST/PENDING)
   user_schedule.py        contextual owner schedule (informational)
+  sessions.py             work session/project registry and resolution
+  mcp.py                  MCP registry + execution proxy (strict correlation)
+  device.py               device daemon: levels, fences, routing, audit ring
+  agent_runs.py           bounded agent loop, verification, checkpoints
+  work_tools.py           per-turn work tool registry (MCP + device schemas)
   routes/profiles.py      GET/PATCH /profiles/owner (mistake-guard token)
   routes/state.py         read-only GET /state
   routes/schedule.py      GET /schedule, GET /awareness, POST /admin/reload-schedule
   routes/life.py          GET /life/today, GET /life/recent, POST /life/generate
   routes/user_schedule.py GET/PATCH /user-schedule (mistake-guard token)
+  routes/sessions.py      GET /work, session list/get/archive, run diagnostics
 identity/                 SOUL.md / PROFILE.md / STATE.md blank templates
+skills/WORK_SKILLS.md     blank work-mode skills template (owner-authored)
 schedule/needs.json       needs/interaction tuning template (conservative defaults)
 life_events/              schema_example.disabled.json (inert; author your own)
 tests/                    unittest suite (no live services required)
@@ -242,10 +249,11 @@ Milestone 0.2.0 scope: the speech and emotion pipeline — ElevenLabs TTS with s
 
 Milestone 0.3.0 scope: needs, interaction, and the owner lived profile — the `schedule/needs.json` tuning template with stats/zones/turn effects/critical shutdown, read-only `GET /state` polls, connection bids (deterministic reply satisfaction + expiry sweep; registration arrives with initiative), metadata-only rhythm histograms, and the owner lived profile: boundary penalties (EN/ES/JA classifiers, metadata-only), reversible soft block (no LLM/bids/history writes; one authored distance line per cooldown), agreements (cap 12 active, persona-tension floors), strict-JSON proposal chain (validated/clamped, raw text never stored), status drift, and agreement aftermath. `GET/PATCH /profiles/owner` ship with the `UPDATE_OWNER_PROFILE` mistake-guard token, and the owner's preferred language joins the reply-language fallback. All of it is flag-gated OFF by default.
 
-Milestone 0.4.0 scope (current): real-time day schedule (`SCHEDULE_DIR` day files, DST-safe resolution, mtime hot reload, `GET /schedule`), the availability ladder (`free`/`soft_busy`/`busy`/`unavailable`; busy/unavailable messages defer into a bounded queue — first message in the window may speak the authored static line, no LLM, no fabricated speech), deferred catch-up (one answer per claimed batch under its own per-owner lock; entries restore on failure and expire after 48h), character life events (block-entry driven generation from enabled templates in `LIFE_EVENTS_DIR`, daily min/max + cooldown + skip activities, pending mentions cleared only after a delivered response, durable Redis fallback store `core:longterm:{owner}`), the awareness block + bounded `[LIFE CONTEXT]` feed (PAST/PENDING markers, `CONTEXT_FEED_MAX_TOKENS` budget), the contextual owner schedule (`GET/PATCH /user-schedule`, informational only, owner timezone changes require the `UPDATE_USER_SCHEDULE` guard), and `POST /admin/reload-schedule` (`RELOAD_SCHEDULE` guard). All flag-gated OFF by default.
+Milestone 0.4.0 scope: real-time day schedule (`SCHEDULE_DIR` day files, DST-safe resolution, mtime hot reload, `GET /schedule`), the availability ladder (`free`/`soft_busy`/`busy`/`unavailable`; busy/unavailable messages defer into a bounded queue — first message in the window may speak the authored static line, no LLM, no fabricated speech), deferred catch-up (one answer per claimed batch under its own per-owner lock; entries restore on failure and expire after 48h), character life events (block-entry driven generation from enabled templates in `LIFE_EVENTS_DIR`, daily min/max + cooldown + skip activities, pending mentions cleared only after a delivered response, durable Redis fallback store `core:longterm:{owner}`), the awareness block + bounded `[LIFE CONTEXT]` feed (PAST/PENDING markers, `CONTEXT_FEED_MAX_TOKENS` budget), the contextual owner schedule (`GET/PATCH /user-schedule`, informational only, owner timezone changes require the `UPDATE_USER_SCHEDULE` guard), and `POST /admin/reload-schedule` (`RELOAD_SCHEDULE` guard). All flag-gated OFF by default.
+
+Milestone 0.5.0 scope (current): work mode and the device daemon — sessions/projects (resolution order: explicit id → latest active for project → auto-create; archived sessions never auto-resume), work prompts with `skills/WORK_SKILLS.md`, the MCP execution proxy (the turn's `context.mcp_servers` is the only execution authority; schema-rich `mcp__server__tool` tools, legacy generic wrappers, strict id/run/connection correlation, structured timeout failures), the bounded agent loop (OpenAI-style tool-call arrays, provider pinning, `MCP_MAX_ITERATIONS` with a no-tools synthesis, verification forcing read-backs for writes), the pause protocol (`[STATUS: question]`/`[STATUS: request_permission]` pause without `done`; durable checkpoints; disconnect marks runs interrupted; explicit session+run ids resume from any device), the device daemon (`device_state` arm/disarm at read/full levels, version-1 schemas rejecting unknown fields, secret-path fences, per-turn caps, metadata-only audit ring, reconnect starts disarmed), work deferral + text-only work catch-up separated from companion entries, and work proceeding under the relationship soft block.
 
 Planned (behind flags that default OFF):
-- Work mode (agentic tool use)
 - Long-term memory (mid-term chapters + optional Chroma)
 - Initiative & proactive reach-out
 

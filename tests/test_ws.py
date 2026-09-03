@@ -57,7 +57,7 @@ class ConnectedFrameTest(unittest.TestCase):
                 self.assertEqual(frame["type"], "connected")
                 self.assertTrue(frame["connection_id"].startswith("conn_"))
                 self.assertEqual(frame["server_version"], VERSION)
-                self.assertEqual(frame["capabilities"], ["text", "heartbeat", "chat_sync"])
+                self.assertEqual(frame["capabilities"], ["text", "heartbeat", "chat_sync", "work", "mcp"])
                 self.assertTrue(frame["server_time"])
 
     def test_non_owner_rejected(self):
@@ -235,7 +235,8 @@ class TurnSemanticsTest(unittest.TestCase):
         self.assertEqual(llm.calls, [])
 
     def test_work_mode_unavailable_error(self):
-        app, _, llm = build_app()
+        app, _, llm = build_app(config=make_config(WORK_ENABLED=False,
+                                                   SESSIONS_ENABLED=False))
         with TestClient(app) as client:
             with client.websocket_connect("/ws/owner") as ws:
                 ws.receive_json()
@@ -375,7 +376,8 @@ class HttpEndpointsTest(unittest.TestCase):
             self.assertEqual(response.json()["error"]["code"], "forbidden_user")
 
     def test_http_message_work_unavailable(self):
-        app, _, _ = build_app()
+        app, _, _ = build_app(config=make_config(WORK_ENABLED=False,
+                                                 SESSIONS_ENABLED=False))
         with TestClient(app) as client:
             response = client.post("/message", json={"text": "x", "mode": "work"})
             self.assertEqual(response.status_code, 400)
@@ -480,7 +482,8 @@ class SpeechPipelineTest(unittest.TestCase):
                 frame = ws.receive_json()
                 self.assertEqual(
                     frame["capabilities"],
-                    ["text", "audio", "voice_input", "heartbeat", "chat_sync"],
+                    ["text", "audio", "voice_input", "heartbeat", "chat_sync",
+                     "work", "mcp"],
                 )
 
     def test_status_section_reports_speech(self):
@@ -823,7 +826,10 @@ class SpeechPipelineTest(unittest.TestCase):
         self.assertEqual(llm.calls, [])
 
     def test_audio_turn_work_mode_rejected(self):
-        app, _, llm = build_app(config=self.speech_config(), stt=FakeSTT())
+        config = self.speech_config()
+        config.WORK_ENABLED = False
+        config.SESSIONS_ENABLED = False
+        app, _, llm = build_app(config=config, stt=FakeSTT())
         with TestClient(app) as client:
             with client.websocket_connect("/ws/owner") as ws:
                 ws.receive_json()

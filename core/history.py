@@ -42,38 +42,59 @@ def make_row(
     text: str,
     delivery_state: str,
     emotion: str = "neutral",
+    mode: str = "companion",
 ) -> dict:
     return {
         "id": new_message_id(),
         "role": role,
         "text": text,
         "emotion": emotion,
+        "mode": mode,
         "ts": utc_now_iso(),
         "delivery_state": delivery_state,
     }
 
 
-async def append_row(
-    cache: RedisCache, owner: str, row: dict, max_rows: int
+def companion_history_key(owner_user_id: str) -> str:
+    return f"core:history:{owner_user_id}:companion"
+
+
+def session_history_key(owner_user_id: str, session_id: str) -> str:
+    """Work-session history; never mixed with companion history (25.2)."""
+    return f"core:history:{owner_user_id}:session:{session_id}"
+
+
+async def append_row_to(
+    cache: RedisCache, key: str, row: dict, max_rows: int
 ) -> dict:
-    await cache.append_row(
-        companion_history_key(owner), json.dumps(row), max_rows
-    )
+    await cache.append_row(key, json.dumps(row), max_rows)
     return row
 
 
-async def load_rows(cache: RedisCache, owner: str) -> list[dict]:
-    raw_rows = await cache.get_rows(companion_history_key(owner))
+async def append_row(
+    cache: RedisCache, owner: str, row: dict, max_rows: int
+) -> dict:
+    return await append_row_to(
+        cache, companion_history_key(owner), row, max_rows
+    )
+
+
+async def load_rows_from(cache: RedisCache, key: str) -> list[dict]:
+    raw_rows = await cache.get_rows(key)
     rows: list[dict] = []
     for raw in raw_rows:
         try:
             row = json.loads(raw)
         except json.JSONDecodeError:
-            log.warning("Skipping malformed history row for owner history")
+            log.warning("Skipping malformed history row")
             continue
         if isinstance(row, dict):
             rows.append(row)
     return rows
+
+
+async def load_rows(cache: RedisCache, owner: str) -> list[dict]:
+    return await load_rows_from(cache, companion_history_key(owner))
 
 
 def delivered_rows(
@@ -96,19 +117,21 @@ async def load_prompt_history(
     budget: int,
     exclude_id: str | None = None,
     exclude_ids: set[str] | None = None,
+    key: str | None = None,
 ) -> list[dict]:
-    """Bounded prior delivered history for the prompt."""
+    """Bounded prior delivered history for the prompt (any channel)."""
     rows = delivered_rows(
-        await load_rows(cache, owner), exclude_id=exclude_id, exclude_ids=exclude_ids
+        await load_rows_from(cache, key or companion_history_key(owner)),
+        exclude_id=exclude_id,
+        exclude_ids=exclude_ids,
     )
     return rows[-budget:] if budget > 0 else []
 
 
-async def mark_delivery_state(
-    cache: RedisCache, owner: str, message_id: str, state: str
+async def mark_delivery_state_key(
+    cache: RedisCache, key: str, message_id: str, state: str
 ) -> bool:
-    """Update one row's delivery state in place. Caller holds the turn lock."""
-    key = companion_history_key(owner)
+    """Update one row's delivery state in place, any channel."""
     raw_rows = await cache.get_rows(key)
     for index, raw in enumerate(raw_rows):
         try:
@@ -120,3 +143,12 @@ async def mark_delivery_state(
             await cache.set_row(key, index, json.dumps(row))
             return True
     return False
+
+
+async def mark_delivery_state(
+    cache: RedisCache, owner: str, message_id: str, state: str
+) -> bool:
+    """Update one row's delivery state in place. Caller holds the turn lock."""
+    return await mark_delivery_state_key(
+        cache, companion_history_key(owner), message_id, state
+    )
