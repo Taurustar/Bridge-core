@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 
 # ---------------------------------------------------------------------------
 # Emotion palette (plan section 13.1). The v1 palette is fixed for wire
@@ -154,6 +154,24 @@ UPDATE_OWNER_PROFILE_TOKEN = "UPDATE_OWNER_PROFILE"
 GENERATE_LIFE_TOKEN = "GENERATE_LIFE"
 RELOAD_SCHEDULE_TOKEN = "RELOAD_SCHEDULE"
 UPDATE_USER_SCHEDULE_TOKEN = "UPDATE_USER_SCHEDULE"
+DELETE_MEMORY_TOKEN = "DELETE_MEMORY"
+WIPE_USER_TOKEN = "WIPE_USER"
+
+# Session-close fan-out frame type (plan section 20.6). The frame shape is
+# additive metadata; clients that ignore it work fine.
+SESSION_RESET_FRAME: dict[str, object] = {"type": "session_reset"}
+
+# Memory cleanup policy (plan section 20.5). Pinned rows never delete.
+# Protected kinds never auto-delete; "important" project rows are protected
+# above the configured importance floor.
+PROTECTED_MEMORY_KINDS: frozenset[str] = frozenset({"user_profile", "relationship"})
+
+# Daily tools (plan section 24). Bounded loop per turn.
+DAILY_TOOL_MAX_CALLS = 6
+DAILY_TOOL_RESULT_MAX_CHARS = 2000
+DAILY_IDEMPOTENCY_MAX_KEYS = 256
+REMINDERS_MAX = 64
+REMINDER_TEXT_MAX_CHARS = 280
 
 # ---------------------------------------------------------------------------
 # Schedule availability ladder (plan sections 16.1, 16.3).
@@ -192,6 +210,56 @@ def busy_count_key(owner_user_id: str) -> str:
 
 def longterm_key(owner_user_id: str) -> str:
     return f"core:longterm:{owner_user_id}"
+
+
+def midterm_key(owner_user_id: str) -> str:
+    """Mid-term chapter ring (plan section 20.2). One row per chapter."""
+    return f"core:midterm:{owner_user_id}:companion"
+
+
+def reminders_key(owner_user_id: str) -> str:
+    """Owner reminders (plan section 24.3): durable notes, not alarms."""
+    return f"core:daily:reminders:{owner_user_id}"
+
+
+def daily_idempotency_key(owner_user_id: str) -> str:
+    """Executed daily-tool mutation keys (plan section 24.2)."""
+    return f"core:daily:idempotency:{owner_user_id}"
+
+
+def wipe_key_patterns(owner_user_id: str) -> list[str]:
+    """Every documented key family for one owner (plan section 28).
+
+    Every inventory entry must appear here, in the store documentation, and
+    in the wipe tests.
+    """
+    owner = owner_user_id
+    return [
+        f"core:history:{owner}:*",
+        f"core:midterm:{owner}:*",
+        f"core:longterm:{owner}",
+        f"core:needs:{owner}",
+        f"core:bids:{owner}",
+        f"core:rhythm:{owner}",
+        f"core:owner_profile:{owner}",
+        f"core:external_profile:{owner}:*",
+        f"core:life:last_block:{owner}",
+        f"core:life:pending:{owner}",
+        f"core:initiative:{owner}",
+        f"core:deferred:{owner}",
+        f"core:busy_count:{owner}",
+        f"core:sessions:{owner}",
+        f"core:projects:{owner}",
+        f"core:pending_agent:{owner}:*",
+        f"core:agent_run:{owner}:*",
+        f"core:mcp_response:{owner}:*",
+        f"core:device_response:{owner}:*",
+        f"core:device:audit:{owner}",
+        f"core:daily:reminders:{owner}",
+        f"core:daily:idempotency:{owner}",
+        f"core:user_schedule:{owner}",
+        f"core:user_schedule:day:{owner}:*",
+    ]
 
 
 def life_last_block_key(owner_user_id: str) -> str:

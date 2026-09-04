@@ -80,6 +80,12 @@ class ContextFeedTest(unittest.TestCase):
         feed, _ = build_context_feed(life_events=events, pending_ids=["m1"])
         self.assertEqual(feed.count("One event."), 1)
 
+    def test_life_row_is_not_rendered_again_as_memory(self):
+        event = life_record("m1", "One event.")
+        feed, _ = build_context_feed(life_events=[event], memories=[event])
+        self.assertEqual(feed.count("One event."), 1)
+        self.assertNotIn("[MEMORY NOTES]", feed)
+
     def test_token_budget_enforced(self):
         events = [life_record(f"m{i}", "x" * 400) for i in range(10)]
         feed, _ = build_context_feed(life_events=events, max_tokens=200)
@@ -87,13 +93,27 @@ class ContextFeedTest(unittest.TestCase):
         # double the budget characters.
         self.assertLess(len(feed), 200 * 4 * 2)
 
+    def test_tight_budget_includes_headers_and_footer(self):
+        event = life_record("m1", "short")
+        feed, included = build_context_feed(
+            life_events=[event], pending_ids=["m1"], max_tokens=40
+        )
+        self.assertEqual(feed, "")
+        self.assertEqual(included, [])
+
+        feed, included = build_context_feed(
+            life_events=[event], pending_ids=["m1"], max_tokens=90
+        )
+        self.assertLessEqual(estimate_tokens(feed), 90)
+        self.assertEqual(included, ["m1"])
+
     def test_pending_wins_slot(self):
         events = [
             life_record("old", "old event"),
             life_record("new", "new event"),
         ]
         feed, included = build_context_feed(
-            life_events=events, pending_ids=["new"], max_tokens=40
+            life_events=events, pending_ids=["new"], max_tokens=80
         )
         self.assertIn("new event", feed)
         self.assertEqual(included, ["new"])

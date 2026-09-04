@@ -16,6 +16,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, WebSocket
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from redis.exceptions import RedisError
 
 from .bridge import Bridge
 from .cache import RedisCache
@@ -79,6 +80,31 @@ def create_app(
 
     app = FastAPI(title="Bridge Core Engine", version=VERSION, lifespan=lifespan)
     app.state.bridge = bridge
+
+    @app.middleware("http")
+    async def memory_backend_errors(request: Request, call_next):
+        """Keep required-store failures structured on the 0.6 admin APIs."""
+        try:
+            return await call_next(request)
+        except (RedisError, ConnectionError, TimeoutError) as exc:
+            path = request.url.path
+            scoped = (
+                path == "/history"
+                or path.startswith("/history/")
+                or path == "/memories"
+                or path.startswith("/memories/")
+                or path.startswith("/admin/wipe/")
+            )
+            if not scoped:
+                raise
+            log.error("Required backend unavailable on %s: %s", path, type(exc).__name__)
+            return JSONResponse(
+                status_code=503,
+                content=error_body(
+                    "redis_unavailable",
+                    "The required data store is temporarily unavailable.",
+                ),
+            )
 
     @app.exception_handler(RequestValidationError)
     async def validation_handler(request: Request, exc: RequestValidationError):
@@ -182,7 +208,20 @@ def create_app(
                 ),
                 "daily_min": cfg.LIFE_DAILY_MIN,
                 "daily_max": cfg.LIFE_DAILY_MAX,
-                "longterm_backend": "redis_fallback",
+                "longterm_backend": bridge.longterm.backend_name,
+            },
+            "memory": {
+                "extraction": cfg.MEMORY_EXTRACTION_ENABLED,
+                "cleanup": cfg.MEMORY_CLEANUP_ENABLED,
+                "compaction_threshold": cfg.COMPANION_COMPACT_THRESHOLD,
+                "keep_recent": cfg.COMPANION_KEEP_RECENT,
+                "longterm_backend": bridge.longterm.backend_name,
+                "chroma_degraded": bridge.longterm.degraded,
+            },
+            "daily_tools": {
+                "enabled": cfg.DAILY_TOOLS_ENABLED,
+                "web": bridge.web.available(),
+                "max_calls": cfg.DAILY_TOOL_MAX_CALLS,
             },
             "user_schedule": {
                 "enabled": bridge.user_schedule.available,
@@ -205,7 +244,10 @@ def create_app(
     async def emotions():
         return bridge.emotions_manifest
 
+    from .routes.admin import register_admin_routes
+    from .routes.history import register_history_routes
     from .routes.life import register_life_routes
+    from .routes.memories import register_memory_routes
     from .routes.profiles import register_profile_routes
     from .routes.schedule import register_schedule_routes
     from .routes.sessions import register_session_routes
@@ -218,6 +260,9 @@ def create_app(
     register_life_routes(app, bridge)
     register_user_schedule_routes(app, bridge)
     register_session_routes(app, bridge)
+    register_history_routes(app, bridge)
+    register_memory_routes(app, bridge)
+    register_admin_routes(app, bridge)
 
     @app.post("/message")
     async def message(request: Request):

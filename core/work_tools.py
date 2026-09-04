@@ -60,6 +60,7 @@ class WorkToolRegistry:
         device_level: str,
         max_chars: int = 30000,
         shell_timeout_max: int = 600,
+        web_schemas: list[dict] | None = None,
     ) -> "WorkToolRegistry":
         servers = parse_servers(context)
         schemas = build_tool_schemas(servers)
@@ -67,12 +68,20 @@ class WorkToolRegistry:
             schemas.extend(
                 device_tool_schemas(device_level, max_chars, shell_timeout_max)
             )
+        if web_schemas:
+            # Work mode may use web search/open independently of companion
+            # daily-tool enablement (plan section 24.5).
+            schemas.extend(web_schemas)
         known = known_tool_names(servers)
         known.update(
             tool
             for level_tools in (DEVICE_TOOLS_READ, DEVICE_TOOLS_FULL)
             for tool in level_tools
         )
+        if web_schemas:
+            known.update(
+                schema["function"]["name"] for schema in web_schemas
+            )
         return cls(
             mcp_servers=servers,
             device_level=device_level,

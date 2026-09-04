@@ -1,11 +1,10 @@
-"""Bridge: wiring and companion turn lifecycle (plan sections 10-12, 14-18, 21-22).
+"""Bridge: wiring and companion turn lifecycle (plan sections 10-12, 14-18, 20-22).
 
 Holds the config, cache, connection manager, LLM router, speech services, the
-0.3.0 needs/interaction/owner-profile engines, and the 0.4.0 schedule, life,
-awareness, catch-up, and contextual owner-schedule engines.
-
-Turn lifecycle (work sessions, memory extraction, and initiative do not exist
-yet and remain flag-off inert):
+0.3.0 needs/interaction/owner-profile engines, the 0.4.0 schedule, life,
+awareness, catch-up, and contextual owner-schedule engines, and the 0.6.0
+three-tier memory backend (mid-term compaction, extraction, session close),
+private daily tools, and the Tavily web tool.
 
 validate owner -> non-empty text -> soft-block gate (plan 12 step 5; while
 blocked: one authored distance line per cooldown, no LLM/bids/history writes)
@@ -54,6 +53,7 @@ from .config import Config
 from .connections import Connection, ConnectionManager
 from .constants import (
     DEFAULT_EMOTION,
+    DAILY_TOOL_RESULT_MAX_CHARS,
     HEARTBEAT_MAX_AGE_SECONDS,
     HEARTBEAT_MAX_FUTURE_SECONDS,
     INITIATIVE_COUNTER_STUB,
@@ -65,14 +65,27 @@ from .constants import (
     agent_run_key,
     pending_agent_key,
 )
-from .context_feed import build_awareness_block, build_context_feed
+from .context_feed import (
+    build_awareness_block,
+    build_context_feed,
+    build_direct_context_blocks,
+)
+from .daily_tools import (
+    DailyToolExecutor,
+    IdempotencyStore,
+    ReminderStore,
+    ToolContext,
+    daily_tool_schemas,
+    sanitize_daily_reply,
+)
 from .device import DeviceManager
 from .emotions import load_emotions_manifest
 from .interaction import DeferredQueue
 from .life import LifeEngine
-from .llm import LLMChainExhausted, LLMResult, LLMRouter
+from .llm import LLMChainExhausted, LLMResult, LLMRouter, ProviderRoute
 from .mcp import MCPProxy, parse_tool_name
-from .memory import LongTermMemory
+from .memory import LongTermMemory, MemoryBackend
+from .memory_tiers import MidTermMemory
 from .needs import NeedsEngine, classify_turn_kind
 from .owner_profile import (
     PROPOSAL_MAX_DELTA,
@@ -111,9 +124,12 @@ from .text_utils import (
     strip_pause_tags,
 )
 from .user_schedule import UserSchedule
+from .web_tools import WebTools
 from .work_tools import WorkToolRegistry
 
 log = logging.getLogger("bridge.turn")
+
+_DAILY_SANITIZER_FALLBACK = "[EMOTION: neutral]\nI cannot answer that safely right now."
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -121,6 +137,19 @@ _MAX_SEQUENCE = 2**64 - 1
 
 # Strict-JSON proposal clamp for background analysis (plan section 18.6).
 OWNER_PROPOSAL_MAX_DELTA = PROPOSAL_MAX_DELTA
+
+
+def _parse_tool_arguments(raw: str) -> dict:
+    """Parse a provider tool-call argument string; malformed JSON is an
+    empty argument set — the executor answers with a structured error
+    instead of raising (plan section 24.2)."""
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
 
 
 def _parse_strict_json_object(raw: str) -> dict | None:
@@ -193,7 +222,12 @@ class Bridge:
         self.owner_profile = OwnerProfile(config, cache)
         self.deferred = DeferredQueue(config, cache)
         self.user_schedule = UserSchedule(config, cache)
-        self.longterm = LongTermMemory(config, cache)
+        self.longterm = MemoryBackend(config, cache)
+        self.midterm = MidTermMemory(config, cache, self.longterm, llm=self.llm)
+        self.reminders = ReminderStore(cache)
+        self.daily_idempotency = IdempotencyStore(cache)
+        self.daily_exec = DailyToolExecutor(config)
+        self.web = WebTools(config)
         self.sessions = SessionStore(config, cache)
         self.mcp = MCPProxy(config, cache, self.connections)
         self.device = DeviceManager(config, cache, self.connections)
@@ -206,6 +240,7 @@ class Bridge:
         self._identity_cache: dict[str, tuple[float, str]] = {}
         self._started_monotonic = time.monotonic()
         self._last_bid_sweep = 0.0
+        self._last_memory_cleanup = 0.0
         self._life_task: asyncio.Task | None = None
         self._life_stop: asyncio.Event | None = None
         # In-process index of pending work pauses (run_id -> connection),
@@ -225,6 +260,13 @@ class Bridge:
                 load_voice_profile(self.config.TTS_VOICE_PROFILE_FILE.strip())
             )
         self.static_lines = load_static_lines(self.config.STATIC_LINES_FILE or None)
+        # Three-tier memory (plan section 20): the durable Redis store of
+        # record plus the optional Chroma index (degraded-safe).
+        self.longterm.start()
+        await self.longterm.reconcile_owner(
+            self.config.OWNER_USER_ID,
+            extra_rows=await self.midterm.all_chapters(self.config.OWNER_USER_ID),
+        )
         # Needs/interaction engines (plan section 15) and the owner lived
         # profile (plan section 18). Flags default OFF; load/validate only
         # when enabled so an inert deployment never touches stores.
@@ -279,9 +321,12 @@ class Bridge:
             "schedule": cfg.SCHEDULE_ENABLED,
             "life": cfg.LIFE_ENABLED,
             "memory_extraction": cfg.MEMORY_EXTRACTION_ENABLED,
+            "memory_cleanup": cfg.MEMORY_CLEANUP_ENABLED,
+            "chroma": cfg.CHROMA_ENABLED,
+            "daily_tools": cfg.DAILY_TOOLS_ENABLED,
+            "daily_web": self.web.available(),
             "initiative": cfg.INITIATIVE_ENABLED,
             "device": cfg.DEVICE_ENABLED,
-            "daily_tools": cfg.DAILY_TOOLS_ENABLED,
             "user_schedule": cfg.USER_SCHEDULE_ENABLED,
         }
 
@@ -923,6 +968,7 @@ class Bridge:
         *,
         source_conn: Connection | None,
         prompt_history: list[dict],
+        current_text: str = "",
     ) -> dict:
         """Shared per-turn block building (plan 12 steps 14-16, 21).
 
@@ -957,17 +1003,27 @@ class Bridge:
         awareness_block = ""
         context_feed_text = ""
         pending_life_ids: list[str] = []
+        chapter_block = ""
         if self.config.SCHEDULE_ENABLED or self.config.USER_SCHEDULE_ENABLED:
             awareness_block = await self._build_awareness_block(
                 owner, source_conn, prompt_history
             )
-        if self.life is not None and self.life.available:
-            context_feed_text, pending_life_ids = await self._build_life_feed(owner)
+        if self.config.CONTEXT_FEED_ENABLED:
+            # The feed is the only renderer for life rows, durable memories,
+            # and mid-term chapters (plan section 20.4).
+            context_feed_text, pending_life_ids = await self._build_context_feed(
+                owner, current_text=current_text
+            )
+        else:
+            context_feed_text, pending_life_ids = await self._build_context_feed(
+                owner, current_text=current_text, direct=True
+            )
         return {
             "state_block": state_block,
             "owner_block": owner_block,
             "awareness_block": awareness_block,
             "context_feed": context_feed_text,
+            "chapter_block": chapter_block,
             "pending_life_ids": pending_life_ids,
             "prompt_profile": prompt_profile,
         }
@@ -1021,13 +1077,38 @@ class Bridge:
             owner_schedule_now=owner_schedule_now,
         )
 
-    async def _build_life_feed(self, owner: str) -> tuple[str, list[str]]:
-        """Bounded life context feed (plan sections 20.4, 21.2)."""
-        events = await self.life.recent(owner, limit=8)
-        pending_ids = await self.life.pending_ids(owner)
-        feed, included = build_context_feed(
-            life_events=events,
+    async def _build_context_feed(
+        self, owner: str, *, current_text: str = "", direct: bool = False
+    ) -> tuple[str, list[str]]:
+        """Single bounded feed for life rows, memories, and chapters
+        (plan sections 20.4, 21.2). At most one semantic memory query per
+        turn; without a query it falls back to the most recent protected
+        facts deterministically."""
+        life_events: list[dict] = []
+        pending_ids: list[str] = []
+        if self.life is not None and self.life.available:
+            life_events = await self.life.recent(owner, limit=8)
+            pending_ids = await self.life.pending_ids(owner)
+
+        if current_text.strip():
+            memories = await self.longterm.search(owner, current_text, limit=6)
+        else:
+            memories = list(
+                reversed(
+                    await self.longterm.records(
+                        owner,
+                        limit=6,
+                    )
+                )
+            )
+
+        chapters = await self.midterm.recent_chapters(owner)
+        renderer = build_direct_context_blocks if direct else build_context_feed
+        feed, included = renderer(
+            life_events=life_events,
             pending_ids=pending_ids,
+            memories=memories,
+            chapters=chapters,
             max_tokens=self.config.CONTEXT_FEED_MAX_TOKENS,
         )
         return feed, [rid for rid in included if rid]
@@ -1517,16 +1598,53 @@ class Bridge:
                 key=history_key,
             )
 
-            device_level = self._device_level_for(owner)
+            websocket_authorized = source_conn is not None
+            device_level = (
+                self._device_level_for(owner) if websocket_authorized else ""
+            )
+            web_permitted = source_conn is not None and self.web.available()
+            web_schemas = (
+                daily_tool_schemas(
+                    web_enabled=True,
+                    schedule_available=False,
+                    user_schedule_available=False,
+                )[-2:]
+                if web_permitted
+                else None
+            )
             registry = WorkToolRegistry.build(
-                context=context,
+                context=context if websocket_authorized else None,
                 device_level=device_level,
                 max_chars=self.config.DEVICE_MAX_OUTPUT_CHARS,
                 shell_timeout_max=self.config.DEVICE_SHELL_TIMEOUT_MAX,
+                web_schemas=web_schemas,
             )
+            turn_web = self.web.for_turn() if web_permitted else None
             turn_calls: list[str] = []
 
             async def executor(name: str, arguments: dict) -> dict:
+                if name in ("web_search", "web_open"):
+                    if turn_web is None:
+                        return {
+                            "ok": False,
+                            "error": (
+                                "tools_require_websocket"
+                                if source_conn is None
+                                else "web_disabled"
+                            ),
+                            "result": None,
+                            "truncated": False,
+                        }
+                    if name == "web_search":
+                        outcome = await turn_web.search(str(arguments.get("query", "")))
+                    else:
+                        outcome = await turn_web.open(str(arguments.get("url", "")))
+                    return {
+                        "ok": bool(outcome.get("ok")),
+                        "result": outcome,
+                        "error": outcome.get("error"),
+                        "truncated": bool(outcome.get("truncated")),
+                    }
                 if not registry.has_tools or name not in registry.known:
                     return {
                         "ok": False, "error": "unknown_tool", "result": None,
@@ -1620,6 +1738,7 @@ class Bridge:
                         and registry.has_tools
                     ),
                     verification_retries=self.config.MCP_VERIFICATION_RETRIES,
+                    reject_tool_calls=not websocket_authorized,
                 )
             except LLMChainExhausted:
                 log.error("Work turn failed: LLM chain exhausted")
@@ -1640,6 +1759,22 @@ class Bridge:
                 if source_conn is not None:
                     await source_conn.send_json(frame)
                 return frame
+
+            if loop.rejected_tool_calls:
+                await self._write_checkpoint(
+                    owner,
+                    session_id_resolved,
+                    run_id=run_id,
+                    state="failed",
+                    loop=loop,
+                    last_error="tools_require_websocket",
+                    started_ts=started_ts,
+                )
+                return error_frame(
+                    "tools_require_websocket",
+                    "Work tools require an originating WebSocket connection.",
+                    terminal=True,
+                )
 
             pause_tag = _parse_pause_status(loop.text)
             if pause_tag:
@@ -2014,6 +2149,131 @@ class Bridge:
             )
         return delivered
 
+    async def _companion_tool_loop(
+        self, messages: list[dict], user_text: str
+    ) -> LLMResult:
+        """Companion provider call with the bounded private daily-tool loop
+        (plan section 24.2). Without ``DAILY_TOOLS_ENABLED`` this is one
+        plain routed call. At most ``DAILY_TOOL_MAX_CALLS`` tool executions
+        per turn; the first successful provider stays pinned; final speech
+        passes the deterministic narration sanitizer, with one tool-less
+        synthesis retry when sanitization leaves nothing speakable."""
+        cfg = self.config
+        schemas: list[dict] | None = None
+        web_available = self.web.available()
+        if cfg.DAILY_TOOLS_ENABLED:
+            schemas = daily_tool_schemas(
+                web_enabled=web_available,
+                schedule_available=self.schedule is not None and self.schedule.available,
+                user_schedule_available=self.user_schedule.available,
+            )
+        turn_web = self.web.for_turn() if web_available else None
+        result = await self.llm.chat("companion", messages, tools=schemas)
+        if not schemas:
+            return result
+
+        pinned = ProviderRoute(provider=result.provider, model=result.model)
+        transcript = list(messages)
+        turn_id = f"turn_{uuid.uuid4().hex}"
+        calls_used = 0
+        while result.tool_calls and calls_used < cfg.DAILY_TOOL_MAX_CALLS:
+            transcript.append({
+                "role": "assistant",
+                "content": result.text or "",
+                "tool_calls": [
+                    {
+                        "id": call["id"],
+                        "type": "function",
+                        "function": {
+                            "name": call["name"],
+                            "arguments": call["arguments"],
+                        },
+                    }
+                    for call in result.tool_calls
+                ],
+            })
+            for call in result.tool_calls:
+                if calls_used >= cfg.DAILY_TOOL_MAX_CALLS:
+                    tool_result = {"ok": False, "error": "tool_call_cap_reached"}
+                else:
+                    calls_used += 1
+                    arguments = _parse_tool_arguments(call.get("arguments", ""))
+                    context = ToolContext(
+                        owner=cfg.OWNER_USER_ID,
+                        user_text=user_text,
+                        turn_id=turn_id,
+                        tool_call_id=call["id"],
+                        reminders=self.reminders,
+                        idempotency=self.daily_idempotency,
+                        web=turn_web,
+                        longterm=self.longterm,
+                        schedule=self.schedule,
+                        user_schedule=self.user_schedule
+                        if self.user_schedule.available
+                        else None,
+                        character_timezone=cfg.CHARACTER_TIMEZONE,
+                        calls_used={"n": calls_used},
+                    )
+                    tool_result = await self.daily_exec.execute(
+                        call["name"], arguments, context
+                    )
+                try:
+                    encoded = json.dumps(tool_result, ensure_ascii=False)
+                except (TypeError, ValueError):
+                    encoded = '{"ok": false, "error": "unserializable_result"}'
+                transcript.append({
+                    "role": "tool",
+                    "tool_call_id": call["id"],
+                    "content": encoded[:DAILY_TOOL_RESULT_MAX_CHARS],
+                })
+            result = await self.llm.chat(
+                "companion", transcript, tools=schemas, pinned=pinned
+            )
+
+        final_text = sanitize_daily_reply(result.text)
+        if not final_text.strip() and result.text.strip():
+            # Sanitization removed all speech: retry synthesis once without
+            # tools (plan section 24.2).
+            try:
+                retry = await self.llm.chat("companion", messages, pinned=pinned)
+                final_text = sanitize_daily_reply(retry.text)
+                if not final_text.strip():
+                    final_text = _DAILY_SANITIZER_FALLBACK
+                result.attempts += retry.attempts
+                if retry.usage:
+                    usage = dict(result.usage or {})
+                    for key, value in retry.usage.items():
+                        usage[key] = usage.get(key, 0) + int(value)
+                    result.usage = usage
+            except LLMChainExhausted:
+                final_text = _DAILY_SANITIZER_FALLBACK
+        result.text = final_text
+        result.tool_calls = None
+        return result
+
+    async def _maybe_compact(self, owner: str) -> None:
+        """Background compaction + policy cleanup (plan sections 20.2, 20.5).
+
+        Runs under the per-owner turn lock; any failure preserves history
+        (plan acceptance) and only logs.
+        """
+        lock = self.connections.turn_lock(owner)
+        async with lock:
+            rows = await hist.load_rows(self.cache, owner)
+            if self.midterm.compaction_needed(rows):
+                try:
+                    await self.midterm.compact(owner, rows, now_ts=time.time())
+                except Exception:  # noqa: BLE001 - background task owns errors
+                    log.warning("Compaction failed; history preserved", exc_info=True)
+            if self.config.MEMORY_CLEANUP_ENABLED:
+                interval = max(self.config.MEMORY_CLEANUP_INTERVAL_HOURS, 1) * 3600
+                if time.time() - self._last_memory_cleanup >= interval:
+                    self._last_memory_cleanup = time.time()
+                    try:
+                        await self.longterm.cleanup(owner, dry_run=False)
+                    except Exception:  # noqa: BLE001
+                        log.warning("Memory cleanup failed", exc_info=True)
+
     async def run_companion_turn(
         self,
         *,
@@ -2113,7 +2373,10 @@ class Bridge:
             # Plan 12 steps 14-16 + identity layer 5: shared block building
             # (needs, owner profile, awareness, bounded context feed).
             blocks = await self._build_prompt_blocks(
-                owner, source_conn=source_conn, prompt_history=prompt_history
+                owner,
+                source_conn=source_conn,
+                prompt_history=prompt_history,
+                current_text=text.strip(),
             )
             prompt_profile = blocks["prompt_profile"]
 
@@ -2130,7 +2393,7 @@ class Bridge:
                 state_block=blocks["state_block"],
                 owner_block=blocks["owner_block"],
                 awareness_block=blocks["awareness_block"],
-                context_feed=blocks["context_feed"],
+                context_feed=blocks["context_feed"] or blocks["chapter_block"],
                 soft_busy_note=soft_busy_note,
             )
 
@@ -2148,7 +2411,7 @@ class Bridge:
             )
 
             try:
-                result = await self.llm.chat("companion", messages)
+                result = await self._companion_tool_loop(messages, text.strip())
             except LLMChainExhausted as exc:
                 log.error("Companion turn failed: LLM chain exhausted")
                 frame = error_frame(
@@ -2285,6 +2548,13 @@ class Bridge:
             )
             self.background_tasks.add(work_catchup_task)
             work_catchup_task.add_done_callback(self.background_tasks.discard)
+
+        # Plan 20.2/20.5: mid-term compaction + policy cleanup, background,
+        # under the turn lock; failure preserves history.
+        if delivered:
+            compact_task = asyncio.create_task(self._maybe_compact(owner))
+            self.background_tasks.add(compact_task)
+            compact_task.add_done_callback(self.background_tasks.discard)
         return done
 
     def _start_profile_analysis(
@@ -2489,6 +2759,7 @@ class Bridge:
             except asyncio.CancelledError:
                 pass
             self._life_task = None
+        await self.web.aclose()
         for task in list(self.background_tasks):
             task.cancel()
         if self.background_tasks:

@@ -172,6 +172,112 @@ class AgentLoopTest(unittest.IsolatedAsyncioTestCase):
 
 
 class WorkTurnTest(unittest.IsolatedAsyncioTestCase):
+    async def test_websocket_work_turn_executes_turn_bound_web(self):
+        bridge, _ = make_bridge()
+
+        class FakeTurnWeb:
+            async def search(self, query):
+                searches.append(query)
+                return {"ok": True, "results": [], "truncated": False}
+
+        class FakeWeb:
+            def available(self):
+                return True
+
+            def for_turn(self):
+                handles.append(FakeTurnWeb())
+                return handles[-1]
+
+        handles = []
+        searches = []
+        bridge.web = FakeWeb()
+        bridge.llm = FakeLLM([
+            tool_call("w1", "web_search", {"query": "current docs"}),
+            "[EMOTION: confident]\nResearch complete.",
+        ])
+
+        done = await bridge.run_work_turn(
+            text="research the docs", language="en", source_conn=DeadConn(),
+        )
+
+        self.assertEqual(done["type"], "done")
+        self.assertEqual(len(handles), 1)
+        self.assertEqual(searches, ["current docs"])
+
+    async def test_http_work_turn_rejects_provider_tool_call(self):
+        bridge, _ = make_bridge()
+
+        class FakeWeb:
+            def available(self):
+                return True
+
+            def for_turn(self):
+                raise AssertionError("HTTP work must not create a web executor")
+
+        class RecordingLLM(FakeLLM):
+            def __init__(self):
+                super().__init__([
+                    tool_call("w1", "web_search", {"query": "private target"}),
+                ])
+                self.offered_tools = []
+
+            async def chat(self, mode, messages, tools=None, pinned=None):
+                self.offered_tools.append(tools)
+                return await super().chat(mode, messages, tools=tools, pinned=pinned)
+
+        bridge.web = FakeWeb()
+        llm = RecordingLLM()
+        bridge.llm = llm
+
+        done = await bridge.run_work_turn(
+            text="research the target", language="en", source_conn=None,
+        )
+
+        self.assertEqual(done["type"], "error")
+        self.assertEqual(done["error"]["code"], "tools_require_websocket")
+        self.assertTrue(done["terminal"])
+        self.assertIsNone(llm.offered_tools[0])
+        self.assertTrue(all(tools is None for tools in llm.offered_tools))
+        self.assertEqual(len(llm.calls), 1)
+
+    async def test_http_work_ignores_armed_device_and_mcp_context(self):
+        bridge, _ = make_bridge(DEVICE_ENABLED=True, MCP_PROXY_ENABLED=True)
+        armed = bridge.connections.connect(object(), "owner")
+        armed.device_armed = True
+        armed.device_level = "full"
+
+        class RecordingLLM(FakeLLM):
+            def __init__(self):
+                super().__init__(["[EMOTION: neutral]\nTool-less answer."])
+                self.offered_tools = []
+
+            async def chat(self, mode, messages, tools=None, pinned=None):
+                self.offered_tools.append(tools)
+                return await super().chat(mode, messages, tools=tools, pinned=pinned)
+
+        async def forbidden_device_call(*args, **kwargs):
+            raise AssertionError("HTTP work must not execute device tools")
+
+        bridge.device.call = forbidden_device_call
+        llm = RecordingLLM()
+        bridge.llm = llm
+        done = await bridge.run_work_turn(
+            text="inspect the project",
+            language="en",
+            source_conn=None,
+            context={
+                "mcp_servers": [{
+                    "name": "fs",
+                    "tools": [{"name": "read_file", "input_schema": {"type": "object"}}],
+                }],
+            },
+        )
+
+        self.assertEqual(done["type"], "done")
+        self.assertEqual(llm.offered_tools, [None])
+        prompt = llm.calls[0][1][0]["content"]
+        self.assertIn("No MCP servers and no armed device", prompt)
+
     async def test_http_work_turn_creates_session_and_isolates_history(self):
         bridge, fake = make_bridge()
         llm = FakeLLM(["[EMOTION: confident]\nDone: analysis complete."])

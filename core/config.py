@@ -208,6 +208,12 @@ class Config:
     MEMORY_CLEANUP_ENABLED: bool = False
     MEMORY_CLEANUP_INTERVAL_HOURS: int = 12
     MEMORY_MAX_PER_USER: int = 1000
+    MEMORY_TEMPERATURE: float = 0.2
+    MEMORY_CHAPTER_MAX_CHARS: int = 800
+    MEMORY_CONVERSATION_TTL_DAYS: int = 30
+    MEMORY_LIFE_TTL_DAYS: int = 365
+    MEMORY_PROTECTED_PROJECT_FLOOR: float = 0.7
+    CONTEXT_FEED_ENABLED: bool = True
 
     # Needs and interaction
     NEEDS_ENABLED: bool = False
@@ -291,6 +297,10 @@ class Config:
     TAVILY_API_KEY: str = ""
     DAILY_WEB_SEARCH_CAP: int = 1
     DAILY_WEB_OPEN_CAP: int = 2
+    DAILY_TOOL_MAX_CALLS: int = 6
+    DAILY_WEB_MAX_BYTES: int = 500_000
+    DAILY_WEB_MAX_TEXT_CHARS: int = 4000
+    DAILY_WEB_TIMEOUT: float = 20.0
 
     # Contextual owner schedule
     USER_SCHEDULE_ENABLED: bool = False
@@ -438,6 +448,31 @@ class Config:
                 "SCHEDULE_SOFT_BUSY_POLICY must be normal or short "
                 f"(got {self.SCHEDULE_SOFT_BUSY_POLICY!r})"
             )
+        if self.COMPANION_KEEP_RECENT < 1:
+            raise ConfigError("COMPANION_KEEP_RECENT must be at least 1")
+        if self.COMPANION_COMPACT_THRESHOLD < 0:
+            raise ConfigError("COMPANION_COMPACT_THRESHOLD must be >= 0 (0 disables compaction)")
+        if self.COMPANION_COMPACT_THRESHOLD > 0 and (
+            self.COMPANION_COMPACT_THRESHOLD <= self.COMPANION_KEEP_RECENT
+        ):
+            raise ConfigError(
+                "COMPANION_COMPACT_THRESHOLD must exceed COMPANION_KEEP_RECENT"
+            )
+        for days_name in ("MEMORY_CONVERSATION_TTL_DAYS", "MEMORY_LIFE_TTL_DAYS"):
+            if getattr(self, days_name) < 1:
+                raise ConfigError(f"{days_name} must be at least 1 day")
+        if not (0.0 <= self.MEMORY_PROTECTED_PROJECT_FLOOR <= 1.0):
+            raise ConfigError("MEMORY_PROTECTED_PROJECT_FLOOR must be between 0 and 1")
+        if not (1 <= self.DAILY_TOOL_MAX_CALLS <= 6):
+            raise ConfigError("DAILY_TOOL_MAX_CALLS must be between 1 and 6")
+        if self.DAILY_WEB_MAX_BYTES < 1024:
+            raise ConfigError("DAILY_WEB_MAX_BYTES must be at least 1024")
+        if self.DAILY_WEB_MAX_TEXT_CHARS < 100:
+            raise ConfigError("DAILY_WEB_MAX_TEXT_CHARS must be at least 100")
+        if self.DAILY_WEB_TIMEOUT <= 0:
+            raise ConfigError("DAILY_WEB_TIMEOUT must be positive")
+        if self.DAILY_WEB_SEARCH_CAP < 0 or self.DAILY_WEB_OPEN_CAP < 0:
+            raise ConfigError("DAILY_WEB_SEARCH_CAP and DAILY_WEB_OPEN_CAP must be >= 0")
         if unknown:
             raise ConfigError(
                 f"LLM_CHAIN contains unknown providers: {', '.join(unknown)}"

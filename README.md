@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  <strong>Version 0.5.0</strong> — Self-hosted backend for a persistent character companion.<br>
+  <strong>Version 0.6.0</strong> — Self-hosted backend for a persistent character companion.<br>
   <em>Lightweight. General-purpose. Privacy-first.</em>
 </p>
 
@@ -35,6 +35,136 @@ Bridge is the **general-purpose, open-source core** born from a much more person
 **Bridge** is that same engine, distilled to its essential architecture, so anyone can host their own persistent character without the overhead of a full simulated life.
 
 > *If Akane is a person living in her own world, Bridge is the world-builder toolkit.*
+
+---
+
+# Akane vs. Bridge Core Engine — Feature & Technology Comparison
+
+**Compared on:** 2026-09-04
+
+Legend: ✅ full · 🟡 partial / simplified · ❌ absent · 🚫 absent by design · 🔜 in progress
+
+---
+
+## Core Transport & Chat
+
+| Feature | Akane | Bridge |
+|---|---|---|
+| Real-time server | FastAPI + WebSocket (persistent, bidirectional) | FastAPI + WebSocket (same architecture) |
+| HTTP message endpoint | ✅ | ✅ |
+| Multi-device sync (shared conversation across devices) | ✅ | ✅ |
+| Heartbeats / presence | ✅ | ✅ |
+| Client modes | Companion + Work (merged programming/agent) | Companion + Work |
+| Client types served | Unity mobile, Desktop, Android, Discord, WhatsApp | Generic WebSocket clients; Unity client in progress |
+
+## LLM Providers
+
+| Provider | Akane | Bridge |
+|---|---|---|
+| Fireworks | ✅ primary (chat + code models) | ✅ primary |
+| Chutes | ✅ fallback | ✅ fallback |
+| Kimi (Moonshot) | ✅ emergency fallback | ❌ |
+| Ollama (local) | ✅ | ✅ |
+| Generic OpenAI-compatible endpoint | ❌ | ✅ |
+| Failover chain + per-provider timeouts | ✅ | ✅ |
+| Function calling / tool calls | ✅ | ✅ |
+
+## Speech & Voice
+
+| Technology | Akane | Bridge |
+|---|---|---|
+| TTS | ElevenLabs (chunked, sequential, emotion-aware speed) | ElevenLabs (chunked, sequential) |
+| STT | Deepgram (+ AssemblyAI option) | Deepgram + AssemblyAI |
+| Emotion palette | 18 emotions, per-chunk emotion metadata for avatar sync | Manifest-driven emotion metadata (neutral set) |
+| Language support | English / Spanish / Japanese, auto-detect + auto-translate | English / Spanish / Japanese, per-message pins |
+| Fallback speech without LLM | 🟡 | ✅ owner-authored static lines (blank = silence) |
+| Server-side audio storage | 🟡 | None (explicit) |
+
+## Memory
+
+| Capability | Akane | Bridge |
+|---|---|---|
+| Short-term history | Redis | Redis |
+| Long-term store | ChromaDB (default) + Qdrant adapter | Redis durable store + optional Chroma semantic index |
+| Vector embeddings | 🔜 dedicated embedder (Fireworks / local sentence-transformers / OpenAI), pgvector cutover in progress | 🟡 Chroma optional; deterministic token-overlap fallback |
+| Memory tiers / compaction | ✅ owner-fact dossier + RAG retrieve router | ✅ mid-term chapters, durable-fact extraction, session-close compaction |
+| Memory maintenance (cleanup, export, snapshot) | ✅ | ❌ |
+| Character identity files | SOUL / PROFILE / STATE + per-channel souls | SOUL / PROFILE / STATE blank templates (owner authors everything) |
+
+## Lived-World Simulation
+
+| Feature | Akane | Bridge |
+|---|---|---|
+| Needs engine (moods, social battery, zones, critical shutdown) | ✅ full | 🟡 simplified, tuning via config template |
+| Appraisal / deep emotion cognition | ✅ | ❌ |
+| Autonomy (living initiative, sleep interrupt, availability) | ✅ | ❌ |
+| Connection bids (character reaches out) | ✅ | 🟡 deterministic, bounded |
+| Real-time character day schedule | ✅ dynamic (she can make time) | ✅ real-time, DST-safe, hot reload |
+| Character life events (things happening in her world) | ✅ rich event library | ✅ owner-authored templates (ships empty) |
+| Owner schedule awareness | ✅ full day model on owner's clock | 🟡 informational schedule |
+| World-time awareness (both clocks, time since last talk) | ✅ | 🟡 |
+| Joint free-time finding + appointments | ✅ | ❌ |
+| Rhythm (owner availability patterns) | ✅ | ✅ metadata-only |
+
+## Relationship & Personality
+
+| Feature | Akane | Bridge |
+|---|---|---|
+| Owner relationship profile (trust, closeness, status) | ✅ with LLM-driven update proposals | ✅ with strict-JSON validated proposals |
+| Boundary detection + reversible soft block | ✅ | ✅ |
+| Binding agreements between character and owner | ✅ | ✅ |
+| State-driven agency (her mood governs her initiative) | ✅ | ❌ |
+| People-pleasing / over-compliance guard | ✅ | ❌ |
+| Personality reinforcement laws | ✅ | ❌ (personality is fully owner-authored) |
+| Intimacy layer (desire, intimate invites, RP gating) | ✅ | 🚫 absent by design |
+| Reflection / self-emergence loops | ✅ | ❌ |
+
+## Work Mode & Tools
+
+| Capability | Akane | Bridge |
+|---|---|---|
+| Work sessions / project registry | ✅ | ✅ |
+| MCP tool proxy (execution on client device) | ✅ | ✅ |
+| Bounded agent loop with verification | ✅ | ✅ |
+| Device daemon (remote file read/write, shell, audit) | ✅ | ✅ |
+| Pause protocol (ask permission / ask question, resumable checkpoints) | ✅ | ✅ |
+| Web search | Tavily | Tavily (with strict SSRF guards) |
+| Daily tools (reminders, silent info checks, schedule writes) | ✅ | ✅ idempotency keys, deterministic intent gate |
+
+## Channels & Surfaces
+
+| Channel | Akane | Bridge |
+|---|---|---|
+| Unity app | ✅ | 🟡 client in development |
+| Desktop app | ✅ | 🟡 via device daemon / specs |
+| Android | ✅ | ❌ |
+| Discord bot | ✅ with safety layer + dedicated memory | 🚫 out of scope |
+| WhatsApp | ✅ with safety layer + dedicated memory + Node.js gateway | 🚫 out of scope |
+
+## Media Generation
+
+| Capability | Akane | Bridge |
+|---|---|---|
+| Image generation | fal.ai (FLUX) | ❌ |
+| Video generation | fal.ai | ❌ |
+| Vision (understands photos you send) | ✅ | ❌ |
+| Media storage / studio | ✅ | ❌ |
+
+## Infrastructure & Security
+
+| Aspect | Akane | Bridge |
+|---|---|---|
+| Network model | VPS behind Tailscale | Self-hosted, Tailscale-only enforced at startup |
+| Datastore | Redis (required) + ChromaDB/Qdrant (memory) | Redis (required) + optional Chroma |
+| Secrets handling | Provider API keys via env file | Env file; secrets never exposed in status/logs |
+| Feature gating | Mixed | Every optional subsystem off by default, flag-enabled |
+
+---
+
+## Bottom Line
+
+Bridge covers the full shared backbone — transport, LLM routing, speech, memory tiers, needs/schedule/life, relationship profile, and the complete work/agentic tool stack — in simplified, owner-authorable form. Akane adds everything that makes her a *person* rather than an engine: intimacy, autonomy, deep emotion cognition, multi-channel presence (Discord/WhatsApp/Android), media generation and vision. The only technologies on Akane's side with no Bridge counterpart at all are Kimi (LLM fallback), Qdrant, pgvector, and fal.ai.
+
 
 ---
 
@@ -187,7 +317,7 @@ profile floors) lives in `schedule/needs.json` — the bundled values are
 engine-safe neutrals, not character calibration; tune them for your
 deployment.
 
-## Repository layout (milestone 0.4.0)
+## Repository layout (milestone 0.6.0)
 
 ```text
 bridge_core.py            entrypoint
@@ -217,8 +347,19 @@ core/
   schedule.py             real-time character day schedule (DST-safe, hot reload)
   interaction.py          bounded deferred queue + busy-ladder counters
   life.py                 block-entry character life events + pending mentions
-  memory.py               durable Redis long-term fallback (core:longterm:{owner})
-  context_feed.py         awareness block + bounded context feed (PAST/PENDING)
+  memory.py               three-tier long-term store: durable Redis rows of record
+                          (core:longterm:{owner}) + merge-by-text upserts, cleanup
+                          policy, deterministic search; optional Chroma index
+  chroma_store.py         optional Chroma semantic index (degrade-safe)
+  memory_tiers.py         mid-term chapter ring (core:midterm:{owner}:companion),
+                          strict-JSON durable-fact extraction, session close
+  daily_tools.py          private daily tools: schemas, bounded loop support,
+                          reminders (core:daily:reminders:{owner}), idempotency,
+                          narration sanitizer
+  web_tools.py            Tavily search/open with SSRF guards (HTTPS-only,
+                          DNS validation, redirect revalidation, byte caps)
+  context_feed.py         awareness block + bounded context feed (PAST/PENDING,
+                          memory notes, chapter notes)
   user_schedule.py        contextual owner schedule (informational)
   sessions.py             work session/project registry and resolution
   mcp.py                  MCP registry + execution proxy (strict correlation)
@@ -231,6 +372,9 @@ core/
   routes/life.py          GET /life/today, GET /life/recent, POST /life/generate
   routes/user_schedule.py GET/PATCH /user-schedule (mistake-guard token)
   routes/sessions.py      GET /work, session list/get/archive, run diagnostics
+  routes/history.py       GET /history, GET /history/midterm, POST /history/close
+  routes/memories.py      GET/POST/PATCH/DELETE /memories, POST /memories/cleanup
+  routes/admin.py         POST /admin/wipe/{owner} (WIPE_USER guard)
 identity/                 SOUL.md / PROFILE.md / STATE.md blank templates
 skills/WORK_SKILLS.md     blank work-mode skills template (owner-authored)
 schedule/needs.json       needs/interaction tuning template (conservative defaults)
@@ -251,16 +395,19 @@ Milestone 0.3.0 scope: needs, interaction, and the owner lived profile — the `
 
 Milestone 0.4.0 scope: real-time day schedule (`SCHEDULE_DIR` day files, DST-safe resolution, mtime hot reload, `GET /schedule`), the availability ladder (`free`/`soft_busy`/`busy`/`unavailable`; busy/unavailable messages defer into a bounded queue — first message in the window may speak the authored static line, no LLM, no fabricated speech), deferred catch-up (one answer per claimed batch under its own per-owner lock; entries restore on failure and expire after 48h), character life events (block-entry driven generation from enabled templates in `LIFE_EVENTS_DIR`, daily min/max + cooldown + skip activities, pending mentions cleared only after a delivered response, durable Redis fallback store `core:longterm:{owner}`), the awareness block + bounded `[LIFE CONTEXT]` feed (PAST/PENDING markers, `CONTEXT_FEED_MAX_TOKENS` budget), the contextual owner schedule (`GET/PATCH /user-schedule`, informational only, owner timezone changes require the `UPDATE_USER_SCHEDULE` guard), and `POST /admin/reload-schedule` (`RELOAD_SCHEDULE` guard). All flag-gated OFF by default.
 
-Milestone 0.5.0 scope (current): work mode and the device daemon — sessions/projects (resolution order: explicit id → latest active for project → auto-create; archived sessions never auto-resume), work prompts with `skills/WORK_SKILLS.md`, the MCP execution proxy (the turn's `context.mcp_servers` is the only execution authority; schema-rich `mcp__server__tool` tools, legacy generic wrappers, strict id/run/connection correlation, structured timeout failures), the bounded agent loop (OpenAI-style tool-call arrays, provider pinning, `MCP_MAX_ITERATIONS` with a no-tools synthesis, verification forcing read-backs for writes), the pause protocol (`[STATUS: question]`/`[STATUS: request_permission]` pause without `done`; durable checkpoints; disconnect marks runs interrupted; explicit session+run ids resume from any device), the device daemon (`device_state` arm/disarm at read/full levels, version-1 schemas rejecting unknown fields, secret-path fences, per-turn caps, metadata-only audit ring, reconnect starts disarmed), work deferral + text-only work catch-up separated from companion entries, and work proceeding under the relationship soft block.
+Milestone 0.5.0 scope: work mode and the device daemon — sessions/projects (resolution order: explicit id → latest active for project → auto-create; archived sessions never auto-resume), work prompts with `skills/WORK_SKILLS.md`, the MCP execution proxy (the turn's `context.mcp_servers` is the only execution authority; schema-rich `mcp__server__tool` tools, legacy generic wrappers, strict id/run/connection correlation, structured timeout failures), the bounded agent loop (OpenAI-style tool-call arrays, provider pinning, `MCP_MAX_ITERATIONS` with a no-tools synthesis, verification forcing read-backs for writes), the pause protocol (`[STATUS: question]`/`[STATUS: request_permission]` pause without `done`; durable checkpoints; disconnect marks runs interrupted; explicit session+run ids resume from any device), the device daemon (`device_state` arm/disarm at read/full levels, version-1 schemas rejecting unknown fields, secret-path fences, per-turn caps, metadata-only audit ring, reconnect starts disarmed), work deferral + text-only work catch-up separated from companion entries, and work proceeding under the relationship soft block.
+
+Milestone 0.6.0 scope (current): three-tier memory and private daily tools — mid-term chapters (history exceeding `COMPANION_COMPACT_THRESHOLD` distills its oldest slice into one bounded chapter in the `core:midterm:{owner}:companion` ring before history is replaced with `COMPANION_KEEP_RECENT` recent rows; any failure preserves history), strict-JSON durable-fact extraction (`MEMORY_*` providers, clamped/validated, secrets/code/prompt-claims filtered, near-duplicates merge with Chroma semantic candidates or deterministic token fallback), policy cleanup (pinned rows never delete; protected kinds survive; conversation decays faster than life; dry-run endpoint), `POST /history/close` (distill + extract + clear only after success + `session_reset` fan-out), the optional Chroma index (Redis stays the store of record; destructive operations and bounded-tier eviction delete Chroma first and preserve Redis on failure; outages degrade semantic search to deterministic token-overlap ranking), the hard-budget context feed as the only deduplicated renderer for memories/chapters/life rows (`CONTEXT_FEED_ENABLED`), private daily tools (`DAILY_TOOLS_ENABLED`: clock/arithmetic/units/planning, durable reminders, owner- and character-schedule reads, memory lookup, owner-schedule writes behind a deterministic explicit-intent gate; at most `DAILY_TOOL_MAX_CALLS` per turn; turn+call idempotency keys; deterministic narration sanitizer with one tool-less retry), and Tavily web search/open (`DAILY_WEB_ENABLED`, HTTPS-only, DNS-validated public hosts, redirect revalidation, byte/text caps, fail-closed without a key). New HTTP: `GET /history`, `GET /history/midterm`, `GET/POST/PATCH/DELETE /memories`, `POST /memories/cleanup`, `POST /admin/wipe/{owner}` (`WIPE_USER` guard clearing every documented key family plus Chroma rows). Compaction runs by threshold; extraction, cleanup, daily tools, and web stay flag-gated OFF.
 
 Planned (behind flags that default OFF):
-- Long-term memory (mid-term chapters + optional Chroma)
 - Initiative & proactive reach-out
 
 Speech flags (`TTS_ENABLED`, `STT_ENABLED`) and the 0.3.0/0.4.0 flags
 (`NEEDS_ENABLED`, `BIDS_ENABLED`, `RHYTHM_ENABLED`, `STATE_EXPRESSION_ENABLED`,
 `OWNER_PROFILE_ENABLED` and sub-flags, `SCHEDULE_ENABLED`, `LIFE_ENABLED`,
-`USER_SCHEDULE_ENABLED`) default OFF; when off, none of their
+`USER_SCHEDULE_ENABLED`, `MEMORY_EXTRACTION_ENABLED`,
+`MEMORY_CLEANUP_ENABLED`, `DAILY_TOOLS_ENABLED`, `DAILY_WEB_ENABLED`) default
+OFF; when off, none of their
 stores, prompt blocks, background tasks, or LLM calls run. See
 `core.env.full.example` for the intended single-owner enabled profile.
 

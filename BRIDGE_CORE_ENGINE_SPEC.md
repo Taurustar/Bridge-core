@@ -3,7 +3,7 @@
 Living implementation contract. It refines unspecified details of
 `BRIDGE_CORE_ENGINE_IMPLEMENTATION_PLAN.md`; it may not override locked
 decisions (plan section 2). Milestones implemented: **0.1.0** through
-**0.5.0**.
+**0.6.0**.
 
 ## Deviations from the plan
 
@@ -35,6 +35,10 @@ decisions (plan section 2). Milestones implemented: **0.1.0** through
   `core/agent_runs.py`, `core/work_tools.py`, and `core/routes/sessions.py`;
   `skills/WORK_SKILLS.md` stays at the plan-layout path
   (`WORK_SKILLS_FILE` overrides).
+  Milestone 0.6.0 adds `core/chroma_store.py` (optional Chroma index),
+  `core/memory_tiers.py` (compaction/extraction/close),
+  `core/daily_tools.py`, `core/web_tools.py`, and the routes `history.py`,
+  `memories.py`, `admin.py`.
 - **Implementation-specific env fields** (allowed by plan 8.3, documented
   here): `LIFE_SKIP_ACTIVITIES` (comma-separated block activities whose
   entries never generate life events; default `sleep`) and
@@ -42,6 +46,73 @@ decisions (plan section 2). Milestones implemented: **0.1.0** through
   leaves soft_busy reply length to "configured policy"). Owner and character
   timezones (`OWNER_TIMEZONE`, `CHARACTER_TIMEZONE`) must be valid IANA
   names and fail startup otherwise (plan 16.2).
+  Milestone 0.6.0 adds `MEMORY_TEMPERATURE`, `MEMORY_CHAPTER_MAX_CHARS`,
+  `MEMORY_CONVERSATION_TTL_DAYS`, `MEMORY_LIFE_TTL_DAYS`,
+  `MEMORY_PROTECTED_PROJECT_FLOOR`, `CONTEXT_FEED_ENABLED`,
+  `DAILY_TOOL_MAX_CALLS`, `DAILY_WEB_MAX_BYTES`,
+  `DAILY_WEB_MAX_TEXT_CHARS`, and `DAILY_WEB_TIMEOUT` (the plan names no
+  variables for chapter size, decay TTLs, the "important project" floor,
+  the tool-call bound, or web caps).
+- **Memory decisions (0.6.0)**, refining unspecified plan details:
+  - Mid-term chapters live in the dedicated ring key
+    `core:midterm:{owner}:companion` (plan section 28 inventory), bounded
+    at 200 chapters, newest written last; they are indexed into Chroma when
+    available. The `conversation_chapter` longterm kind is reserved for
+    admin/manual rows.
+  - Compaction is threshold-gated (`COMPANION_COMPACT_THRESHOLD`, 0
+    disables) rather than flag-gated: with no `MEMORY_*` providers
+    configured the distill call fails and history is preserved untouched
+    (no keys created).
+  - Chroma uses one collection (`bridge_memories`) with the owner id in row
+    metadata; Redis longterm rows remain the store of record and every
+    Chroma failure degrades semantic search to deterministic token-overlap
+    + recency/importance ranking. Chroma's default embedding model may
+    download on first use — offline deployments should keep
+    `CHROMA_ENABLED=false`.
+  - On startup, an available Chroma index is reconciled from Redis. If
+    `CHROMA_REQUIRED=true`, an unavailable index fails startup instead of
+    degrading. A failed Chroma owner wipe returns `503 wipe_failed` and
+    preserves Redis rows so the endpoint never reports a partial wipe as
+    complete. Memory DELETE and non-dry-run cleanup also delete Chroma first;
+    failure returns `503` and preserves Redis. Longterm and midterm capacity
+    eviction use the same Chroma-first rule. Reconciliation removes Chroma
+    ids absent from both durable Redis tiers.
+  - Chroma-enabled near-duplicate merge queries same-kind semantic candidates
+    and applies the `0.85` cosine-similarity threshold. If Chroma is absent or
+    degraded, deterministic normalized-token overlap uses the same threshold.
+  - Cleanup TTLs: conversation-family rows expire after
+    `MEMORY_CONVERSATION_TTL_DAYS`, life-family (and commitment/project
+    below `MEMORY_PROTECTED_PROJECT_FLOOR`) after `MEMORY_LIFE_TTL_DAYS`;
+    pinned rows and `user_profile`/`relationship` never auto-delete.
+  - Deleting a pinned memory row via `DELETE /memories/{id}` returns
+    `409 pinned_memory` (unpin first); cleanup requires
+    `MEMORY_CLEANUP_ENABLED` and answers `409 feature_disabled` otherwise.
+  - Context-feed budgeting estimates the complete rendered block, including
+    section headers and the interpretation footer. A life row retrieved by
+    both life and memory paths renders once, using its life PAST/PENDING form.
+  - Daily-tool mutation intent ("explicit intent in the current owner
+    message", plan 24.2) is enforced deterministically: reminder writes
+    require reminder/remember wording, owner-schedule writes require
+    schedule/availability wording; otherwise the tool returns a structured
+    `explicit_intent_required` error the character relays naturally.
+    Negated and read-only question forms do not authorize mutations.
+    Reminder create, update, and delete mutations commit their idempotency
+    token atomically with the Redis change.
+  - The narration sanitizer removes deterministic tool/API/execution
+    phrases from the final companion reply; when nothing speakable
+    survives, synthesis retries once without tools (plan 24.2).
+  - Web transport (plan 24.4) resolves and validates every address for each
+    hop, then connects to one validated public IP. The original hostname is
+    retained in the HTTP `Host` header and TLS SNI for certificate validation.
+    Redirects are manual, capped at 3, and independently resolved and pinned.
+  - New key family added to the plan section 28 inventory:
+    `core:daily:idempotency:{owner}` (executed daily-tool mutation keys,
+    bounded at 256) — it is covered by the wipe patterns and tests. The
+    reminder key follows the plan's inventory exactly
+    (`core:daily:reminders:{owner}`).
+  - `session_reset` is a bare additive frame (`{"type": "session_reset"}`)
+    fanned out to all owner devices after a successful `POST /history/close`
+    (plan section 20.6); clients that ignore it keep working.
 - **Work decisions (0.5.0)**, refining unspecified plan details:
   - The critical-shutdown "emergency-work override" (plan 25.1) has no
     env field in the section 8.3 inventory, so it is not implemented;
@@ -754,7 +825,7 @@ integration tests):
   requests and replay scripted responses.
 - HTTP+WS tests use FastAPI's `TestClient`; no network, no live Redis.
 
-## Redis keys in 0.1.0–0.5.0
+## Redis keys in 0.1.0–0.6.0
 
 `core:history:{owner}:companion` (list of JSON rows: `id`, `role`, `text`,
 `emotion`, `ts`, `delivery_state`) is the only key a flags-off deployment
@@ -775,11 +846,11 @@ ON): `core:sessions:{owner}`, `core:projects:{owner}`,
 `core:mcp_response:{owner}:{request_id}` /
 `core:device_response:{owner}:{request_id}` (deleted after consumption),
 and `core:device:audit:{owner}` (metadata only; `DEVICE_ENABLED`).
-**Audio is never stored server-side** —
+With 0.6.0: `core:midterm:{owner}:companion` (bounded chapter ring; appears once compaction first stores a chapter), `core:daily:reminders:{owner}` (DAILY_TOOLS_ENABLED reminder writes), and `core:daily:idempotency:{owner}` (executed mutation keys). `core:longterm:{owner}` rows beyond character life events appear when extraction or admin CRUD writes durable facts. **Audio is never stored server-side** —
 audio bytes exist only in flight, and the STT/TTS paths write no keys. All
 other keys in plan section 28 belong to later milestones.
 
 ## Version source
 
-`core/constants.py::VERSION = "0.4.0"` is the single source; the entrypoint
+`core/constants.py::VERSION = "0.6.0"` is the single source; the entrypoint
 docstring, README, `connected` frame, and `/status` derive from it.

@@ -19,12 +19,15 @@ from core.cache import RedisCache
 from core.config import Config
 from core.llm import LLMChainExhausted, LLMResult
 from core.speech import TTSError
+from redis.exceptions import WatchError
 
 
 class FakePipeline:
-    def __init__(self, store: dict[str, list[str]]) -> None:
-        self._store = store
+    def __init__(self, client: "FakeRedis") -> None:
+        self._client = client
+        self._store = client.store
         self._ops: list[tuple] = []
+        self._watched: dict[str, int] = {}
 
     def rpush(self, key: str, value: str) -> "FakePipeline":
         self._ops.append(("rpush", key, value))
@@ -38,12 +41,40 @@ class FakePipeline:
         self._ops.append(("delete", key))
         return self
 
+    def set(self, key: str, value: str) -> "FakePipeline":
+        self._ops.append(("set", key, value))
+        return self
+
+    async def watch(self, *keys: str) -> None:
+        self._watched = {key: self._client.versions.get(key, 0) for key in keys}
+
+    async def lrange(self, key: str, start: int, end: int) -> list[str]:
+        await asyncio.sleep(0)
+        return await self._client.lrange(key, start, end)
+
+    async def get(self, key: str) -> str | None:
+        await asyncio.sleep(0)
+        return await self._client.get(key)
+
+    def multi(self) -> None:
+        pass
+
+    async def reset(self) -> None:
+        self._ops.clear()
+        self._watched.clear()
+
     async def execute(self) -> list[Any]:
+        if any(
+            self._client.versions.get(key, 0) != version
+            for key, version in self._watched.items()
+        ):
+            raise WatchError("watched key changed")
         results: list[Any] = []
         for op in self._ops:
             if op[0] == "rpush":
                 _, key, value = op
                 self._store.setdefault(key, []).append(value)
+                self._client.versions[key] = self._client.versions.get(key, 0) + 1
                 results.append(len(self._store[key]))
             elif op[0] == "ltrim":
                 _, key, start, end = op
@@ -52,10 +83,17 @@ class FakePipeline:
                 lo = start if start >= 0 else max(n + start, 0)
                 hi = end if end >= 0 else n + end
                 self._store[key] = rows[lo : hi + 1]
+                self._client.versions[key] = self._client.versions.get(key, 0) + 1
                 results.append(True)
             elif op[0] == "delete":
                 _, key = op
                 results.append(1 if self._store.pop(key, None) is not None else 0)
+                self._client.versions[key] = self._client.versions.get(key, 0) + 1
+            elif op[0] == "set":
+                _, key, value = op
+                self._client.strings[key] = value
+                self._client.versions[key] = self._client.versions.get(key, 0) + 1
+                results.append(True)
         self._ops.clear()
         return results
 
@@ -66,6 +104,7 @@ class FakeRedis:
     def __init__(self) -> None:
         self.store: dict[str, list[str]] = {}
         self.strings: dict[str, str] = {}
+        self.versions: dict[str, int] = {}
         self.up = True
 
     async def ping(self) -> bool:
@@ -74,7 +113,7 @@ class FakeRedis:
         return True
 
     def pipeline(self, transaction: bool = True) -> FakePipeline:
-        return FakePipeline(self.store)
+        return FakePipeline(self)
 
     async def lrange(self, key: str, start: int, end: int) -> list[str]:
         rows = self.store.get(key, [])
@@ -85,6 +124,7 @@ class FakeRedis:
 
     async def lset(self, key: str, index: int, value: str) -> bool:
         self.store[key][index] = value
+        self.versions[key] = self.versions.get(key, 0) + 1
         return True
 
     async def llen(self, key: str) -> int:
@@ -92,6 +132,7 @@ class FakeRedis:
 
     async def set(self, key: str, value: str) -> bool:
         self.strings[key] = value
+        self.versions[key] = self.versions.get(key, 0) + 1
         return True
 
     async def get(self, key: str) -> str | None:
@@ -103,6 +144,7 @@ class FakeRedis:
             removed += 1
         if self.strings.pop(key, None) is not None:
             removed += 1
+        self.versions[key] = self.versions.get(key, 0) + 1
         return removed
 
     async def keys(self, pattern: str = "*") -> list[str]:
@@ -247,6 +289,82 @@ class FakeTTS:
 
     async def aclose(self) -> None:
         pass
+
+
+class FakeChroma:
+    """Scriptable Chroma substitute for the memory backend tests.
+
+    ``fail=True`` simulates an unavailable/outaged Chroma: start() degrades
+    and every later call raises, mirroring the failure-tolerant adapter
+    contract. ``indexed`` exposes upserted rows keyed by id for assertions.
+    """
+
+    def __init__(self, fail: bool = False, retain_deletes: bool = False) -> None:
+        self.fail = fail
+        self.retain_deletes = retain_deletes
+        self.available = False
+        self.indexed: dict[str, dict] = {}
+        self.semantic_candidates: list[tuple[str, float]] = []
+
+    def start(self) -> None:
+        if self.fail:
+            self.available = False
+            return
+        self.available = True
+
+    def _require(self) -> None:
+        if self.fail or not self.available:
+            raise RuntimeError("fake chroma is down")
+
+    def upsert(self, owner: str, rows: list[dict]) -> None:
+        self._require()
+        for row in rows:
+            self.indexed[str(row["id"])] = {
+                "owner": owner,
+                "kind": row.get("kind", ""),
+                "text": row.get("text", ""),
+            }
+
+    def delete(self, record_ids: list[str]) -> None:
+        self._require()
+        if self.retain_deletes:
+            return
+        for record_id in record_ids:
+            self.indexed.pop(str(record_id), None)
+
+    def delete_owner(self, owner: str) -> None:
+        self._require()
+        if self.retain_deletes:
+            return
+        self.indexed = {
+            key: value
+            for key, value in self.indexed.items()
+            if value.get("owner") != owner
+        }
+
+    def query(self, owner: str, text: str, kinds: list[str] | None, limit: int) -> list[str]:
+        return [
+            record_id
+            for record_id, _ in self.query_candidates(owner, text, kinds, limit)
+        ]
+
+    def query_candidates(
+        self, owner: str, text: str, kinds: list[str] | None, limit: int
+    ) -> list[tuple[str, float]]:
+        self._require()
+        return self.semantic_candidates[:limit]
+
+    def ids(self, owner: str) -> list[str]:
+        self._require()
+        return [
+            record_id
+            for record_id, value in self.indexed.items()
+            if value.get("owner") == owner
+        ]
+
+    def count(self, owner: str) -> int:
+        self._require()
+        return sum(1 for value in self.indexed.values() if value.get("owner") == owner)
 
 
 class FakeSchedule:

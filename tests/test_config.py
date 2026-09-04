@@ -83,6 +83,20 @@ class ConfigDefaultsTest(unittest.TestCase):
             Config.from_env(env_file=None, environ={"LLM_CHAIN": "fireworks,mystery"})
         self.assertIn("mystery", str(ctx.exception))
 
+    def test_daily_tool_max_calls_enforces_protocol_range(self):
+        for value in (0, 7):
+            with self.subTest(value=value), self.assertRaises(ConfigError):
+                Config.from_env(
+                    env_file=None,
+                    environ={"DAILY_TOOL_MAX_CALLS": str(value)},
+                )
+        self.assertEqual(
+            Config.from_env(
+                env_file=None, environ={"DAILY_TOOL_MAX_CALLS": "6"}
+            ).DAILY_TOOL_MAX_CALLS,
+            6,
+        )
+
     def test_full_example_parses_and_enables_owner_features(self):
         """Plan section 8.4: the full single-owner profile must parse."""
         config = Config.from_env(env_file=str(FULL_EXAMPLE), environ={})

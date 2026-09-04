@@ -21,3 +21,5 @@ uvicorn==0.52.4
 uvloop==0.22.1
 watchfiles==1.2.0
 websockets==17.1
+# Optional: pip install 'bridge-core-engine[chroma]' for semantic long-term memory
+# chromadb==0.5.23

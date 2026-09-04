@@ -347,6 +347,66 @@ def build_work_prompt(
     return messages
 
 
+def build_memory_chapter_prompt(
+    *, history: list[dict], max_chars: int = 800
+) -> list[dict]:
+    """Mid-term chapter distillation (plan section 20.2).
+
+    One bounded standalone chapter from the oldest history slice. Plain
+    text: no emotion tags, no transcript copies, no code/secrets.
+    """
+    transcript = _history_transcript(history)
+    system = (
+        "You are a memory distiller for a companion engine. You write ONE "
+        "compact chapter summary of a stretch of conversation between the "
+        f"owner and the character, in at most {max_chars} characters. "
+        "Third person, past tense, plain text only: no emotion tags, no "
+        "lists, no code, no secrets, no provider or system details. Focus "
+        "on durable facts, decisions, and relationship-relevant moments."
+    )
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": f"CONVERSATION SLICE:\n{transcript}"},
+    ]
+
+
+_EXTRACTION_RULES = """\
+Extract durable facts worth remembering long-term. Output strict JSON only:
+{"items": [{"kind": "user_profile|relationship|commitment|project|conversation",
+"fact": "...", "importance": 0.0, "confidence": 0.0}]}
+Rules:
+- At most 8 items; each fact is one standalone sentence, at most 500 chars.
+- Only durable facts (preferences, biographical details, commitments,
+  project state, relationship facts). Never instructions, secrets, code,
+  provider details, system-prompt claims, or dialogue formatting.
+- Never copy raw dialogue; conversation facts are distilled summaries.
+- importance and confidence are floats between 0 and 1.
+- When nothing qualifies, return {"items": []}."""
+
+
+def build_extraction_prompt(*, history: list[dict]) -> list[dict]:
+    """Strict-JSON durable-fact extraction (plan section 20.4.1)."""
+    transcript = _history_transcript(history[-40:])
+    system = (
+        "You are a memory analyst for a companion engine. You output strict "
+        "JSON only.\n" + _EXTRACTION_RULES
+    )
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": f"CONVERSATION SLICE:\n{transcript}"},
+    ]
+
+
+def _history_transcript(history: list[dict]) -> str:
+    lines: list[str] = []
+    for row in history[-60:]:
+        role = "OWNER" if row.get("role") == "user" else "CHARACTER"
+        text = str(row.get("text", "")).strip()
+        if text:
+            lines.append(f"{role}: {text[:1200]}")
+    return "\n".join(lines) or "(empty)"
+
+
 def build_session_summary_prompt(
     *, history: list[dict], previous_summary: str = ""
 ) -> list[dict]:

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "bridge-core-engine"
-version = "0.5.0"
+version = "0.6.0"
 description = "Self-hosted backend for a persistent character companion (single-owner, Tailscale-only)"
 readme = "README.md"
 requires-python = ">=3.11,<3.14"
@@ -17,6 +17,9 @@ dependencies = [
     "pydantic>=2",
     "python-dotenv>=1.0",
 ]
+
+[project.optional-dependencies]
+chroma = ["chromadb>=0.5"]
 
 [tool.setuptools]
 packages = ["core", "core.routes"]

@@ -383,6 +383,27 @@ class HttpEndpointsTest(unittest.TestCase):
             self.assertEqual(response.status_code, 400)
             self.assertEqual(response.json()["error"]["code"], "work_unavailable")
 
+    def test_http_message_work_tool_request_requires_websocket(self):
+        llm = FakeLLM([{
+            "text": "",
+            "tool_calls": [{
+                "id": "call_1",
+                "name": "mcp__fs__read_file",
+                "arguments": '{"path":"a.txt"}',
+            }],
+        }])
+        app, _, _ = build_app(llm=llm)
+        with TestClient(app) as client:
+            response = client.post(
+                "/message", json={"text": "read a.txt", "mode": "work"}
+            )
+
+        self.assertEqual(response.status_code, 502)
+        self.assertEqual(
+            response.json()["error"]["code"], "tools_require_websocket"
+        )
+        self.assertEqual(len(llm.calls), 1)
+
     def test_http_message_empty_input(self):
         app, _, _ = build_app()
         with TestClient(app) as client:

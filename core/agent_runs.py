@@ -53,6 +53,7 @@ class AgentLoopResult:
     unverified_writes: list[dict] = field(default_factory=list)
     transcript: list[dict] = field(default_factory=list)
     hit_iteration_limit: bool = False
+    rejected_tool_calls: bool = False
 
 
 def _merge_usage(total: dict[str, int], result: LLMResult) -> dict[str, int]:
@@ -99,6 +100,7 @@ async def run_agent_loop(
     max_iterations: int,
     verification_enabled: bool,
     verification_retries: int,
+    reject_tool_calls: bool = False,
 ) -> AgentLoopResult:
     """Execute one bounded tool loop. Only LLMChainExhausted propagates."""
     transcript: list[dict] = [dict(message) for message in messages]
@@ -152,6 +154,11 @@ async def run_agent_loop(
 
             if not reply.tool_calls:
                 result.text = reply.text
+                break
+
+            if reject_tool_calls:
+                result.tool_calls_made = len(reply.tool_calls)
+                result.rejected_tool_calls = True
                 break
 
             transcript.append(

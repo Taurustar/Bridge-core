@@ -6,9 +6,9 @@
   now, time since the last conversation, and the contextual owner-schedule
   state when enabled. Owner schedule context is informational only.
 - The context feed is the single bounded renderer for durable memories,
-  recent life events (marked PAST), and pending life mentions (marked
-  PENDING). In 0.4.0 the only durable source is character life events; the
-  same event is never injected twice. The hard token budget
+  recent life events (marked PAST), pending life mentions (marked PENDING),
+  and mid-term chapters (plan section 20.4: when the feed is enabled it is
+  the only renderer for those sources). The hard token budget
   (``CONTEXT_FEED_MAX_TOKENS``) is enforced with a deterministic
   characters-to-token estimate.
 - Nothing here writes to stores; building blocks is pure.
@@ -65,52 +65,123 @@ def _format_life_event(record: dict, *, pending: bool) -> str:
     return f"- [{marker}] ({day}, at {place}) {text}"
 
 
+def _format_memory(record: dict) -> str:
+    kind = str(record.get("kind", "fact"))
+    text = str(record.get("text", "")).strip()
+    return f"- [{kind}] {text}"
+
+
+def _format_chapter(record: dict) -> str:
+    text = str(record.get("text", "")).strip()
+    return f"- {text}"
+
+
+_CONTEXT_FOOTER = (
+    "Life context entries marked PAST already happened; they are not "
+    "currently happening. PENDING entries happened recently and the "
+    "owner has not been told about them yet. MEMORY NOTES and CHAPTER "
+    "NOTES are durable background; they are not the current turn."
+)
+
+
 def build_context_feed(
     *,
     life_events: list[dict] | None = None,
     pending_ids: list[str] | None = None,
+    memories: list[dict] | None = None,
+    chapters: list[dict] | None = None,
     max_tokens: int = 700,
 ) -> tuple[str, list[str]]:
     """Bounded context feed (plan sections 20.4, 21.2).
 
-    ``life_events`` are durable character-life rows (recent first at index
-    0). ``pending_ids`` marks rows the owner has not heard about yet — those
-    render as PENDING and always win a slot over their PAST twin. Returns
-    ``(block_text, included_pending_ids)`` so callers clear only the pending
-    mentions the response actually received (plan section 17.3).
+    The feed is the only renderer for durable memories, life rows, and
+    mid-term chapters (plan section 20.4). ``life_events`` are durable
+    character-life rows (recent first at index 0); ``memories`` are ranked
+    durable facts; ``chapters`` are newest-first mid-term summaries.
+    ``pending_ids`` marks life rows the owner has not heard about yet —
+    those render as PENDING and always win a slot over their PAST twin.
+    Returns ``(block_text, included_pending_ids)`` so callers clear only the
+    pending mentions the response actually received (plan section 17.3).
     """
     events = list(life_events or [])
+    memories = list(memories or [])
+    chapters = list(chapters or [])
+    life_ids = {str(row.get("id")) for row in events if row.get("id")}
+    memories = [
+        row
+        for row in memories
+        if not row.get("id") or str(row.get("id")) not in life_ids
+    ]
     pending = set(pending_ids or [])
-    if not events:
+    if not events and not memories and not chapters:
         return "", []
 
     pending_rows = [row for row in events if row.get("id") in pending]
     past_rows = [row for row in events if row.get("id") not in pending]
 
-    lines: list[str] = ["[LIFE CONTEXT]"]
-    budget = max(max_tokens, 1)
-    used = estimate_tokens("\n".join(lines))
+    lines: list[str] = []
+    budget = max(max_tokens, 0)
     included: list[str] = []
 
-    def fits(line: str) -> bool:
-        return used + estimate_tokens(line) <= budget
+    def append_if_fits(header: str, line: str) -> bool:
+        candidate = list(lines)
+        if header not in candidate:
+            candidate.append(header)
+        candidate.append(line)
+        candidate.append(_CONTEXT_FOOTER)
+        if estimate_tokens("\n".join(candidate)) > budget:
+            return False
+        if header not in lines:
+            lines.append(header)
+        lines.append(line)
+        return True
 
-    for row in pending_rows:
-        line = _format_life_event(row, pending=True)
-        if fits(line):
-            lines.append(line)
-            used += estimate_tokens(line)
-            included.append(row.get("id"))
-    for row in past_rows:
-        line = _format_life_event(row, pending=False)
-        if fits(line):
-            lines.append(line)
-            used += estimate_tokens(line)
-    if len(lines) == 1:
+    if pending_rows or past_rows:
+        header = "[LIFE CONTEXT]"
+        for row in pending_rows:
+            line = _format_life_event(row, pending=True)
+            if append_if_fits(header, line):
+                included.append(row.get("id"))
+        for row in past_rows:
+            line = _format_life_event(row, pending=False)
+            append_if_fits(header, line)
+    if memories:
+        header = "[MEMORY NOTES]"
+        for row in memories:
+            line = _format_memory(row)
+            if not append_if_fits(header, line):
+                break
+    if chapters:
+        header = "[CHAPTER NOTES]"
+        for row in chapters:
+            line = _format_chapter(row)
+            if not append_if_fits(header, line):
+                break
+
+    if not lines:
         return "", []
-    lines.append(
-        "Life context entries marked PAST already happened; they are not "
-        "currently happening. PENDING entries happened recently and the "
-        "owner has not been told about them yet."
-    )
+    lines.append(_CONTEXT_FOOTER)
     return "\n".join(lines), included
+
+
+def build_direct_context_blocks(
+    *,
+    life_events: list[dict] | None = None,
+    pending_ids: list[str] | None = None,
+    memories: list[dict] | None = None,
+    chapters: list[dict] | None = None,
+    max_tokens: int = 700,
+) -> tuple[str, list[str]]:
+    """Render the same bounded sources as direct prompt blocks.
+
+    This is the fallback required when the unified context-feed feature is
+    disabled. Keeping one formatter preserves source limits, PAST/PENDING
+    markings, and the hard token budget in both modes.
+    """
+    return build_context_feed(
+        life_events=life_events,
+        pending_ids=pending_ids,
+        memories=memories,
+        chapters=chapters,
+        max_tokens=max_tokens,
+    )
