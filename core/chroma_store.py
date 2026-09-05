@@ -7,18 +7,37 @@ store of record and nothing in the chat path depends on Chroma.
 
 One collection holds every owner (single-owner deployments in practice);
 the owner id rides in row metadata so wipe/delete are precise. All methods
-are synchronous; callers wrap them in ``asyncio.to_thread``.
+are synchronous; callers await them through ``run_chroma_call``, which runs
+each call on one dedicated worker thread (plan 6.1) — never the event loop
+and never the default multi-thread executor, so Chroma's SQLite-backed
+client is never accessed concurrently.
 """
 
 from __future__ import annotations
 
+import asyncio
+import functools
 import logging
+from concurrent.futures import ThreadPoolExecutor
 
 from .config import Config
 
 log = logging.getLogger("bridge.chroma")
 
 COLLECTION_NAME = "bridge_memories"
+
+# Dedicated single-thread executor for blocking Chroma operations (plan
+# 6.1). One thread per process serializes every Chroma call; its worker is
+# joined at interpreter exit by concurrent.futures' atexit hook.
+_CHROMA_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="chroma")
+
+
+async def run_chroma_call(fn, *args, **kwargs):
+    """Await one blocking Chroma call on the dedicated executor."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        _CHROMA_EXECUTOR, functools.partial(fn, *args, **kwargs)
+    )
 
 
 class ChromaMemoryStore:
@@ -126,4 +145,4 @@ class ChromaMemoryStore:
         }
 
 
-__all__ = ["ChromaMemoryStore"]
+__all__ = ["ChromaMemoryStore", "run_chroma_call"]

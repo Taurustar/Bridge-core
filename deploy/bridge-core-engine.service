@@ -1,0 +1,45 @@
+# Bridge Core Engine systemd unit (plan section 27.4).
+#
+# Install (as root, adjust /opt/bridge-core-engine to your runtime dir):
+#   cp deploy/bridge-core-engine.service /etc/systemd/system/
+#   systemctl daemon-reload
+#   systemctl enable --now bridge-core-engine
+#
+# Requirements matched by this unit:
+# - Dedicated Unix user (create: useradd --system --home /opt/bridge-core-engine
+#   --shell /usr/sbin/nologin bridgecore; chown -R bridgecore:bridgecore /opt/bridge-core-engine)
+# - Working directory is the runtime directory (relative paths in core.env
+#   such as CHROMA_PATH=./data/chroma and the initiative seed resolve there).
+# - Gitignored env file loaded with EnvironmentFile=.
+# - Restart on failure with a 5s delay; graceful SIGTERM (uvicorn stops
+#   accepting, in-flight turns get ~TimeoutStopSec to finish).
+# - Logs to journald: journalctl -u bridge-core-engine -f
+# - Starts after network, Redis, and tailscaled.
+
+[Unit]
+Description=Bridge Core Engine
+After=network-online.target redis-server.service tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=bridgecore
+Group=bridgecore
+WorkingDirectory=/opt/bridge-core-engine
+EnvironmentFile=/opt/bridge-core-engine/core.env
+ExecStart=/opt/bridge-core-engine/.venv/bin/python bridge_core.py
+Restart=on-failure
+RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+# Hardening: the engine needs almost nothing beyond its directory and the
+# tailnet. Relax PrivateTmp only if you enable device-daemon tools that must
+# see real user paths.
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

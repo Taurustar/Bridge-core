@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-VERSION = "0.7.0"
+VERSION = "1.0.0"
 
 # ---------------------------------------------------------------------------
 # Emotion palette (plan section 13.1). The v1 palette is fixed for wire

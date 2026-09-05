@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  <strong>Version 0.7.0</strong> — Self-hosted backend for a persistent character companion.<br>
+  <strong>Version 1.0.0</strong> — Self-hosted backend for a persistent character companion.<br>
   <em>Lightweight. General-purpose. Privacy-first.</em>
 </p>
 
@@ -40,7 +40,7 @@ Bridge is the **general-purpose, open-source core** born from a much more person
 
 # Akane vs. Bridge Core Engine — Feature & Technology Comparison
 
-**Compared on:** 2026-09-04
+**Compared on:** 2026-09-06
 
 Legend: ✅ full · 🟡 partial / simplified · ❌ absent · 🚫 absent by design · 🔜 in progress
 
@@ -50,120 +50,103 @@ Legend: ✅ full · 🟡 partial / simplified · ❌ absent · 🚫 absent by de
 
 | Feature | Akane | Bridge |
 |---|---|---|
-| Real-time server | FastAPI + WebSocket (persistent, bidirectional) | FastAPI + WebSocket (same architecture) |
-| HTTP message endpoint | ✅ | ✅ |
-| Multi-device sync (shared conversation across devices) | ✅ | ✅ |
-| Heartbeats / presence | ✅ | ✅ |
-| Client modes | Companion + Work (merged programming/agent) | Companion + Work |
-| Client types served | Unity mobile, Desktop, Android, Discord, WhatsApp | Generic WebSocket clients; Unity client in progress |
+| Real-time server | FastAPI + WebSocket | FastAPI + WebSocket (same architecture) |
+| Multi-device sync / heartbeats | ✅ | ✅ |
+| Delivery guarantees | ✅ | ✅ startup reconciliation + client `message_ack` |
+| Client modes | Companion + Work | Companion + Work |
+| Clients served | Unity, Desktop, Android, Discord, WhatsApp | Generic WS clients; Unity client in progress |
 
 ## LLM Providers
 
 | Provider | Akane | Bridge |
 |---|---|---|
-| Fireworks | ✅ primary (chat + code models) | ✅ primary |
+| Fireworks | ✅ primary | ✅ primary |
 | Chutes | ✅ fallback | ✅ fallback |
-| Kimi (Moonshot) | ✅ emergency fallback | ❌ |
+| Kimi (Moonshot) | ✅ emergency | ❌ |
 | Ollama (local) | ✅ | ✅ |
-| Generic OpenAI-compatible endpoint | ❌ | ✅ |
-| Failover chain + per-provider timeouts | ✅ | ✅ |
-| Function calling / tool calls | ✅ | ✅ |
+| OpenAI-compatible endpoint | ❌ | ✅ |
+| Failover chain + function calling | ✅ | ✅ |
 
 ## Speech & Voice
 
 | Technology | Akane | Bridge |
 |---|---|---|
-| TTS | ElevenLabs (chunked, sequential, emotion-aware speed) | ElevenLabs (chunked, sequential) |
-| STT | Deepgram (+ AssemblyAI option) | Deepgram + AssemblyAI |
-| Emotion palette | 18 emotions, per-chunk emotion metadata for avatar sync | Manifest-driven emotion metadata (neutral set) |
-| Language support | English / Spanish / Japanese, auto-detect + auto-translate | English / Spanish / Japanese, per-message pins |
-| Fallback speech without LLM | 🟡 | ✅ owner-authored static lines (blank = silence) |
-| Server-side audio storage | 🟡 | None (explicit) |
+| TTS | ElevenLabs (chunked, emotion-aware) | ElevenLabs (chunked, sequential) |
+| STT | Deepgram (+ AssemblyAI) | Deepgram + AssemblyAI |
+| Languages | EN / ES / JA + auto-translate | EN / ES / JA pins |
+| No-LLM fallback speech | 🟡 | ✅ owner-authored static lines |
 
 ## Memory
 
 | Capability | Akane | Bridge |
 |---|---|---|
-| Short-term history | Redis | Redis |
-| Long-term store | ChromaDB (default) + Qdrant adapter | Redis durable store + optional Chroma semantic index |
-| Vector embeddings | 🔜 dedicated embedder (Fireworks / local sentence-transformers / OpenAI), pgvector cutover in progress | 🟡 Chroma optional; deterministic token-overlap fallback |
-| Memory tiers / compaction | ✅ owner-fact dossier + RAG retrieve router | ✅ mid-term chapters, durable-fact extraction, session-close compaction |
-| Memory maintenance (cleanup, export, snapshot) | ✅ | ❌ |
-| Character identity files | SOUL / PROFILE / STATE + per-channel souls | SOUL / PROFILE / STATE blank templates (owner authors everything) |
+| Short-term / durable store | Redis | Redis |
+| Semantic memory | ChromaDB default; **live pgvector backend** (asyncpg pool, cosine retrieve); Qdrant/mem0 export-only | Optional Chroma + deterministic token-overlap fallback |
+| Embeddings | ✅ dedicated embedder (Fireworks / local sentence-transformers / OpenAI) powering pgvector | 🟡 via Chroma |
+| Organization | ✅ memory cabinet — Redis desk + pgvector archive, tagged drawers (owner facts / her lore / episodic) | ✅ mid-term chapters + durable-fact extraction |
+| Maintenance | ✅ cleanup, export, snapshot, migration tooling | 🟡 precise wipe/delete only |
 
 ## Lived-World Simulation
 
 | Feature | Akane | Bridge |
 |---|---|---|
-| Needs engine (moods, social battery, zones, critical shutdown) | ✅ full | 🟡 simplified, tuning via config template |
+| Needs engine | ✅ full | 🟡 simplified |
 | Appraisal / deep emotion cognition | ✅ | ❌ |
-| Autonomy (living initiative, sleep interrupt, availability) | ✅ | ❌ |
-| Connection bids (character reaches out) | ✅ | 🟡 deterministic, bounded |
-| Real-time character day schedule | ✅ dynamic (she can make time) | ✅ real-time, DST-safe, hot reload |
-| Character life events (things happening in her world) | ✅ rich event library | ✅ owner-authored templates (ships empty) |
-| Owner schedule awareness | ✅ full day model on owner's clock | 🟡 informational schedule |
-| World-time awareness (both clocks, time since last talk) | ✅ | 🟡 |
-| Joint free-time finding + appointments | ✅ | ❌ |
+| Autonomy engine (availability overlays, sleep interrupt) | ✅ | ❌ |
+| Proactive reach-out (initiative) | ✅ | 🟡 heartbeat-driven initiative — cadence-seeded, hard-suppressed by schedule/needs/soft block, model may answer SILENCE |
+| Character schedule | ✅ dynamic | ✅ real-time, DST-safe |
+| Character life events | ✅ rich library | ✅ owner-authored templates |
+| Owner schedule & world-time awareness | ✅ | 🟡 |
+| Joint free-time + appointments | ✅ | ❌ |
 | Rhythm (owner availability patterns) | ✅ | ✅ metadata-only |
 
 ## Relationship & Personality
 
 | Feature | Akane | Bridge |
 |---|---|---|
-| Owner relationship profile (trust, closeness, status) | ✅ with LLM-driven update proposals | ✅ with strict-JSON validated proposals |
-| Boundary detection + reversible soft block | ✅ | ✅ |
-| Binding agreements between character and owner | ✅ | ✅ |
-| State-driven agency (her mood governs her initiative) | ✅ | ❌ |
-| People-pleasing / over-compliance guard | ✅ | ❌ |
-| Personality reinforcement laws | ✅ | ❌ (personality is fully owner-authored) |
-| Intimacy layer (desire, intimate invites, RP gating) | ✅ | 🚫 absent by design |
-| Reflection / self-emergence loops | ✅ | ❌ |
+| Owner relationship profile | ✅ LLM-driven proposals | ✅ strict-JSON proposals |
+| Boundaries + reversible soft block | ✅ | ✅ |
+| Binding agreements | ✅ | ✅ |
+| Agency / people-pleasing guards | ✅ | ❌ |
+| Intimacy layer | ✅ | 🚫 absent by design (test-enforced exclusion) |
+| Reflection / emergence | ✅ | ❌ |
 
 ## Work Mode & Tools
 
 | Capability | Akane | Bridge |
 |---|---|---|
-| Work sessions / project registry | ✅ | ✅ |
-| MCP tool proxy (execution on client device) | ✅ | ✅ |
-| Bounded agent loop with verification | ✅ | ✅ |
-| Device daemon (remote file read/write, shell, audit) | ✅ | ✅ |
-| Pause protocol (ask permission / ask question, resumable checkpoints) | ✅ | ✅ |
-| Web search | Tavily | Tavily (with strict SSRF guards) |
-| Daily tools (reminders, silent info checks, schedule writes) | ✅ | ✅ idempotency keys, deterministic intent gate |
+| Sessions / MCP proxy / agent loop / device daemon / pause protocol | ✅ all | ✅ all |
+| Agent loop controls | ✅ iteration cap + visible "looking" status + let/ping/notify relay | ✅ bounded iterations + status frames |
+| Secret-shape scrubbing | ✅ | ✅ secret-path fences |
+| Web search | Tavily | Tavily (strict SSRF guards) |
+| Daily tools (reminders, silent checks) | ✅ | ✅ idempotency + intent gate |
 
-## Channels & Surfaces
-
-| Channel | Akane | Bridge |
-|---|---|---|
-| Unity app | ✅ | 🟡 client in development |
-| Desktop app | ✅ | 🟡 via device daemon / specs |
-| Android | ✅ | ❌ |
-| Discord bot | ✅ with safety layer + dedicated memory | 🚫 out of scope |
-| WhatsApp | ✅ with safety layer + dedicated memory + Node.js gateway | 🚫 out of scope |
-
-## Media Generation
+## Channels & Media
 
 | Capability | Akane | Bridge |
 |---|---|---|
-| Image generation | fal.ai (FLUX) | ❌ |
-| Video generation | fal.ai | ❌ |
-| Vision (understands photos you send) | ✅ | ❌ |
-| Media storage / studio | ✅ | ❌ |
+| Discord / WhatsApp (with safety layers) | ✅ | 🚫 no gateway (excluded by design) |
+| External-user profiles | ✅ live per-channel profiles + memory | 🟡 dormant profile store with guarded admin CRUD — foundation only, never injected into companion turns |
+| Android | ✅ | ❌ |
+| Image & video generation | fal.ai (FLUX) | ❌ |
+| Vision (photo understanding) | ✅ | ❌ |
 
 ## Infrastructure & Security
 
 | Aspect | Akane | Bridge |
 |---|---|---|
 | Network model | VPS behind Tailscale | Self-hosted, Tailscale-only enforced at startup |
-| Datastore | Redis (required) + ChromaDB/Qdrant (memory) | Redis (required) + optional Chroma |
-| Secrets handling | Provider API keys via env file | Env file; secrets never exposed in status/logs |
+| Datastore | Redis + ChromaDB / pgvector (PostgreSQL) | Redis + optional Chroma |
+| Observability | ✅ per-turn wall-clock timing telemetry | 🟡 non-secret status/diagnostics |
+| Deployment tooling | systemd service | ✅ full kit: systemd unit, deployment guide, ops runbook, config validator, WS smoke tests |
 | Feature gating | Mixed | Every optional subsystem off by default, flag-enabled |
+| Design-exclusion enforcement | — | ✅ test-enforced (no gateway/media/intimacy/appraisal code can sneak in) |
 
 ---
 
 ## Bottom Line
 
-Bridge covers the full shared backbone — transport, LLM routing, speech, memory tiers, needs/schedule/life, relationship profile, and the complete work/agentic tool stack — in simplified, owner-authorable form. Akane adds everything that makes her a *person* rather than an engine: intimacy, autonomy, deep emotion cognition, multi-channel presence (Discord/WhatsApp/Android), media generation and vision. The only technologies on Akane's side with no Bridge counterpart at all are Kimi (LLM fallback), Qdrant, pgvector, and fal.ai.
+Bridge's initiative engine has arrived — proactive reach-out is no longer Akane-only, though Bridge's version is deliberately restrained (heartbeat-cadence, heavily suppressed) versus Akane's full autonomy engine. Akane's memory stack has leveled up to a true vector architecture (live pgvector + dedicated embedder + cabinet organization), which is now its clearest technical lead. Bridge's external-profile store lays dormant groundwork for public channels without shipping any gateway. Akane's exclusive territory remains: intimacy, autonomy/appraisal depth, live multi-channel presence, and media/vision. Technologies with no Bridge counterpart: Kimi, Qdrant/mem0, pgvector, PostgreSQL, and fal.ai.
 
 
 ---
@@ -225,7 +208,10 @@ authentication.
 ```
 
 Tests use an in-memory Redis substitute and mocked LLM transports; no live
-services or network are needed.
+services or network are needed. Deployment checks use the release tooling:
+`scripts/validate_config.py core.env` before any (re)start and
+`scripts/ws_smoke.py --host <tailscale-ip> --user <owner> --probe-foreign-user`
+against a running server.
 
 ## Deployment: Tailscale required (read before running remotely)
 
@@ -317,7 +303,7 @@ profile floors) lives in `schedule/needs.json` — the bundled values are
 engine-safe neutrals, not character calibration; tune them for your
 deployment.
 
-## Repository layout (milestone 0.7.0)
+## Repository layout (milestone 1.0.0)
 
 ```text
 bridge_core.py            entrypoint
@@ -384,6 +370,9 @@ identity/                 SOUL.md / PROFILE.md / STATE.md blank templates
 skills/WORK_SKILLS.md     blank work-mode skills template (owner-authored)
 schedule/needs.json       needs/interaction tuning template (conservative defaults)
 life_events/              schema_example.disabled.json (inert; author your own)
+deploy/                   bridge-core-engine.service (systemd unit, plan 27.4)
+scripts/                  validate_config.py + ws_smoke.py (release tooling)
+docs/                     DEPLOYMENT / ENVIRONMENT / OPERATIONS / RELEASE_AUDIT
 tests/                    unittest suite (no live services required)
 ```
 
@@ -404,9 +393,9 @@ Milestone 0.5.0 scope: work mode and the device daemon — sessions/projects (re
 
 Milestone 0.6.0 scope: three-tier memory and private daily tools — mid-term chapters (history exceeding `COMPANION_COMPACT_THRESHOLD` distills its oldest slice into one bounded chapter in the `core:midterm:{owner}:companion` ring before history is replaced with `COMPANION_KEEP_RECENT` recent rows; any failure preserves history), strict-JSON durable-fact extraction (`MEMORY_*` providers, clamped/validated, secrets/code/prompt-claims filtered, near-duplicates merge with Chroma semantic candidates or deterministic token fallback), policy cleanup (pinned rows never delete; protected kinds survive; conversation decays faster than life; dry-run endpoint), `POST /history/close` (distill + extract + clear only after success + `session_reset` fan-out), the optional Chroma index (Redis stays the store of record; destructive operations and bounded-tier eviction delete Chroma first and preserve Redis on failure; outages degrade semantic search to deterministic token-overlap ranking), the hard-budget context feed as the only deduplicated renderer for memories/chapters/life rows (`CONTEXT_FEED_ENABLED`), private daily tools (`DAILY_TOOLS_ENABLED`: clock/arithmetic/units/planning, durable reminders, owner- and character-schedule reads, memory lookup, owner-schedule writes behind a deterministic explicit-intent gate; at most `DAILY_TOOL_MAX_CALLS` per turn; turn+call idempotency keys; deterministic narration sanitizer with one tool-less retry), and Tavily web search/open (`DAILY_WEB_ENABLED`, HTTPS-only, DNS-validated public hosts, redirect revalidation, byte/text caps, fail-closed without a key). New HTTP: `GET /history`, `GET /history/midterm`, `GET/POST/PATCH/DELETE /memories`, `POST /memories/cleanup`, `POST /admin/wipe/{owner}` (`WIPE_USER` guard clearing every documented key family plus Chroma rows). Compaction runs by threshold; extraction, cleanup, daily tools, and web stay flag-gated OFF.
 
-Milestone 0.7.0 scope (current): heartbeat-driven initiative and the dormant external-user profile foundation — the initiative engine (`INITIATIVE_ENABLED`, default OFF): valid heartbeats count once per owner-global 60-second bucket no matter how many devices send, daily counters reset on the owner's civil day (`OWNER_TIMEZONE`), a `SHA-256` cadence roll over a private deployment seed (`INITIATIVE_SEED_FILE`, created once at `./data/initiative_seed`, never logged) decides eligibility so the engine never fires mechanically every Nth beat, and daily max / min gap / active turn / character schedule / critical needs / soft block (plus optional contextual owner-schedule sleep/busy via `INITIATIVE_RESPECT_OWNER_SCHEDULE`) all hard-suppress before generation. A candidate generates one short proactive message (deterministic reason: pending life mention, bond need, low fun, or a recent open thread; the model may answer `SILENCE`, which delivers nothing and counts nothing) and delivers through the standard pending/delivery protocol under the owner history lock: the `done` frame and `chat_sync` carry additive `initiative`/`initiative_action`/`initiated_by` origin metadata, counters advance and a connection bid registers only after source delivery plus delivered-history persistence, and `heartbeat_ack.initiative_counter` now reports the live heartbeat count (still `0` with the engine off). Webhook completion: startup reconciliation turns stale `pending` assistant rows into `delivery_unknown`, and a WS `message_ack` moves a matching row to `delivered` (idempotent). Dormant gateway profiles (plan section 19): `core:external_profile:{owner}:{platform}:{external_id}` documents with admin CRUD at `GET/POST/PATCH/DELETE /profiles/external[/...]` under the `UPDATE_EXTERNAL_PROFILE` / `DELETE_EXTERNAL_PROFILE` mistake guards — `EXTERNAL_USER_PROFILE_STORE_ENABLED=false` answers `409 feature_disabled` and creates no keys, and with the store on but behavior off (default) nothing in the app or any LLM path ever reads the records.
+Milestone 0.7.0 scope: heartbeat-driven initiative and the dormant external-user profile foundation — the initiative engine (`INITIATIVE_ENABLED`, default OFF): valid heartbeats count once per owner-global 60-second bucket no matter how many devices send, daily counters reset on the owner's civil day (`OWNER_TIMEZONE`), a `SHA-256` cadence roll over a private deployment seed (`INITIATIVE_SEED_FILE`, created once at `./data/initiative_seed`, never logged) decides eligibility so the engine never fires mechanically every Nth beat, and daily max / min gap / active turn / character schedule / critical needs / soft block (plus optional contextual owner-schedule sleep/busy via `INITIATIVE_RESPECT_OWNER_SCHEDULE`) all hard-suppress before generation. A candidate generates one short proactive message (deterministic reason: pending life mention, bond need, low fun, or a recent open thread; the model may answer `SILENCE`, which delivers nothing and counts nothing) and delivers through the standard pending/delivery protocol under the owner history lock: the `done` frame and `chat_sync` carry additive `initiative`/`initiative_action`/`initiated_by` origin metadata, counters advance and a connection bid registers only after source delivery plus delivered-history persistence, and `heartbeat_ack.initiative_counter` now reports the live heartbeat count (still `0` with the engine off). Webhook completion: startup reconciliation turns stale `pending` assistant rows into `delivery_unknown`, and a WS `message_ack` moves a matching row to `delivered` (idempotent). Dormant gateway profiles (plan section 19): `core:external_profile:{owner}:{platform}:{external_id}` documents with admin CRUD at `GET/POST/PATCH/DELETE /profiles/external[/...]` under the `UPDATE_EXTERNAL_PROFILE` / `DELETE_EXTERNAL_PROFILE` mistake guards — `EXTERNAL_USER_PROFILE_STORE_ENABLED=false` answers `409 feature_disabled` and creates no keys, and with the store on but behavior off (default) nothing in the app or any LLM path ever reads the records.
 
-Planned (milestone 1.0.0): operations and release hardening — systemd unit, Tailscale deployment guide, config validation script, WS smoke script, resource cleanup and deadline audit, and the complete regression suite.
+Milestone 1.0.0 scope (current, release): operations and release hardening — a deployable systemd unit (`deploy/bridge-core-engine.service`: dedicated user, `EnvironmentFile=`, restart-on-failure, SIGTERM, journald, Redis/tailscaled ordering), the end-to-end Tailscale deployment guide (`docs/DEPLOYMENT.md`: network model, bind decision, firewall, tested ACL examples, health checks, upgrades), the full environment reference (`docs/ENVIRONMENT.md`; release tests enforce every config field is documented), the day-2 runbook (`docs/OPERATIONS.md`), the config validation script (`scripts/validate_config.py`, exit-coded, never prints secrets) and WS smoke script (`scripts/ws_smoke.py`, /health + connected + heartbeat_ack + error paths + foreign-user rejection), the resource cleanup and deadline audit (`docs/RELEASE_AUDIT.md`; found and fixed Chroma blocking ops moving from the default thread pool to a dedicated single-thread executor per plan 6.1), the excluded-forever audit (no gateway/media/intimacy/appraisal/reflection/SER/loop/auth code — test-enforced), and the completed regression suite (release tests pin version sources, documentation completeness, wipe coverage of every documented Redis key, and a fully inert flags-off boot).
 
 Speech flags (`TTS_ENABLED`, `STT_ENABLED`) and the 0.3.0/0.4.0 flags
 (`NEEDS_ENABLED`, `BIDS_ENABLED`, `RHYTHM_ENABLED`, `STATE_EXPRESSION_ENABLED`,
