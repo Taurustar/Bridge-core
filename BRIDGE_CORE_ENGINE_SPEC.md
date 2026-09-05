@@ -3,7 +3,7 @@
 Living implementation contract. It refines unspecified details of
 `BRIDGE_CORE_ENGINE_IMPLEMENTATION_PLAN.md`; it may not override locked
 decisions (plan section 2). Milestones implemented: **0.1.0** through
-**0.6.0**.
+**0.7.0**.
 
 ## Deviations from the plan
 
@@ -39,6 +39,9 @@ decisions (plan section 2). Milestones implemented: **0.1.0** through
   `core/memory_tiers.py` (compaction/extraction/close),
   `core/daily_tools.py`, `core/web_tools.py`, and the routes `history.py`,
   `memories.py`, `admin.py`.
+  Milestone 0.7.0 adds `core/initiative.py` (heartbeat-initiative state,
+  counting, cadence roll, delivery accounting) and `core/external_profiles.py`
+  plus `core/routes/external_profiles.py` (dormant store and admin APIs).
 - **Implementation-specific env fields** (allowed by plan 8.3, documented
   here): `LIFE_SKIP_ACTIVITIES` (comma-separated block activities whose
   entries never generate life events; default `sleep`) and
@@ -53,6 +56,12 @@ decisions (plan section 2). Milestones implemented: **0.1.0** through
   `DAILY_WEB_MAX_TEXT_CHARS`, and `DAILY_WEB_TIMEOUT` (the plan names no
   variables for chapter size, decay TTLs, the "important project" floor,
   the tool-call bound, or web caps).
+  Milestone 0.7.0 adds `INITIATIVE_RESPECT_OWNER_SCHEDULE` (plan 23.3
+  step 12 makes the contextual owner-schedule suppression "optional" but
+  the section 8.3 inventory names no variable; default false) and
+  `INITIATIVE_SEED_FILE` (plan 23.4 says the deployment seed lives in "a
+  private local state file" without naming a path; default
+  `./data/initiative_seed`).
 - **Memory decisions (0.6.0)**, refining unspecified plan details:
   - Mid-term chapters live in the dedicated ring key
     `core:midterm:{owner}:companion` (plan section 28 inventory), bounded
@@ -113,6 +122,97 @@ decisions (plan section 2). Milestones implemented: **0.1.0** through
   - `session_reset` is a bare additive frame (`{"type": "session_reset"}`)
     fanned out to all owner devices after a successful `POST /history/close`
     (plan section 20.6); clients that ignore it keep working.
+- **Initiative decisions (0.7.0)**, refining unspecified plan details:
+  - Counting runs only when both `HEARTBEAT_ENABLED` and
+    `INITIATIVE_ENABLED` are on. The plan's trigger order counts a
+    heartbeat before its disabled check, but the section 28 rule that keys
+    are never written while their feature flag is off wins: a flags-off
+    deployment never creates `core:initiative:{owner}` and the ack keeps
+    the constant stub counter `0`.
+  - `heartbeat_ack.initiative_counter` is the owner's live
+    `heartbeat_count`. Counting happens inline before the ack (it is a
+    bounded read-modify-write under the per-owner initiative lock, never
+    the turn lock, so heartbeats stay acknowledged while a turn runs).
+    Replayed/out-of-order sequences skip the engine entirely.
+  - Atomicity uses the per-owner initiative asyncio lock plus one
+    read-modify-write of the state document instead of Redis
+    transactions/Lua: the engine is single-process per deployment, so the
+    lock serializes every mutator (same pattern as the profile lock).
+  - Cadence roll (plan 23.4): SHA-256 of `<seed>:<owner day key>:<counted
+    heartbeat number>` mapped to [0,1); the heartbeat counts as eligible
+    when the roll is below `INITIATIVE_ELIGIBILITY_CHANCE`. The seed is 32
+    random bytes hex, created once at `INITIATIVE_SEED_FILE`, never logged;
+    an unusable seed file disables initiative with a startup warning
+    instead of degrading to a random roll.
+  - Target rule: the connection stored at the threshold-crossing bucket is
+    preferred while still connected and the owner turn lock is free;
+    otherwise the most recently active valid owner connection is used.
+    With no owner connection left, the candidate aborts with decision
+    metadata `no_target` (no accounting; a later heartbeat re-rolls).
+  - Reason selection (plan 23.3 step 13) is deterministic with priority:
+    pending life mention -> bond zone strained/deprived -> fun zone
+    low/critical -> delivered companion history within the last 48 hours
+    ("recent open thread", a module constant
+    `INITIATIVE_THREAD_WINDOW_SECONDS` because the plan names no window).
+    When none applies, the candidate aborts (`no_reason`). "Critical
+    needs" suppression means needs shutdown or any zone in
+    `critical`/`deprived`.
+  - `SILENCE` convention: a proactive reply whose only spoken content is
+    empty or the literal token `SILENCE` (case/punctuation tolerant)
+    delivers nothing, writes no history, and performs no accounting; the
+    heartbeat count is not reset, so later valid buckets keep counting.
+    Emotion-only proactive replies are treated as silence (the companion
+    retry rule of plan 12.21 is not applied to initiative).
+  - Initiative origin metadata: the `done` frame carries the plan 23.5
+    fields plus additive `segments`/`provider`/`model`/`tokens` (wire
+    stability, same as companion done). History rows and `chat_sync`
+    frames for initiative messages carry additive
+    `initiated_by`/`initiative`/`initiative_action` fields; user-authored
+    rows never carry them (plan 23.5). The bid is registered only after
+    source delivery plus delivered-history persistence, using the
+    `open_bid_lifetime_seconds` tuning value.
+  - Delivery reconciliation (plan 10.10 + 12): on startup, assistant rows
+    left `pending` beyond 60 seconds (`PENDING_UNKNOWN_THRESHOLD_SECONDS`,
+    module constant) become `delivery_unknown`; a WS `message_ack` with a
+    matching id moves a `pending`/`delivery_unknown` row to `delivered`
+    under the owner history lock. Unknown ids and duplicates are
+    idempotently ignored. This completes the plan 12 crash-recovery loop
+    the plan 10.10 ack exists for.
+  - The server-side heartbeat "rate limit" (plan 23.3 validity rules) is
+    the owner-global bucket claim itself: at most one count per owner
+    bucket regardless of device count, so faster clients cannot accelerate
+    anything.
+- **Dormant external-profile decisions (0.7.0)**, refining plan section 19:
+  - `PATCH /profiles/external/{platform}/{external_id}` requires the
+    `UPDATE_EXTERNAL_PROFILE` `X-Confirm-Token` mistake-guard header — the
+    plan 19.5 route list says "with confirm token" but the plan 29
+    constants name only `DELETE_EXTERNAL_PROFILE`; the new constant is
+    recorded here rather than left implicit.
+  - `POST /profiles/external/{platform}/{external_id}` is added (same
+    guard as PATCH) so the dormant store can actually hold records; plan
+    19.5 lists no create route and plan 29's "create/mutation responses"
+    convention implies one. Missing records on GET/PATCH/DELETE still
+    return 404.
+  - `external_id` rejects `/` and control characters (1-160 chars
+    otherwise, stored literally, URL-encoded in HTTP paths) because the
+    ASGI router splits raw path segments; gateway ids like
+    `discord:123` or `telegram:987654321` are unaffected.
+  - Bounded fields (plan 19.3 fixes types but no sizes):
+    `display_name` <= 120 chars, `summary` <= 1000, `aliases` <= 16 x 120,
+    `likes`/`topics`/`boundaries_seen`/`observations` <= 16 x 200,
+    `tone` <= 32 (blank normalizes to `neutral`),
+    `preferred_language` blank or one of en/es/ja, `familiarity`/`trust`
+    integers 0-100. Patching is partial; unknown fields are 400 errors
+    (plan 29); an optional body `version` field returns
+    `409 version_conflict` when stale.
+  - Listing uses the standard envelope, sorted `updated_ts desc,
+    subject_id asc` (plan 29). The middleware maps Redis failures on
+    `/profiles/external*` to structured `503 redis_unavailable`.
+  - `EXTERNAL_USER_PROFILES_BEHAVIOR_ENABLED` and
+    `EXTERNAL_USER_PROFILE_LLM_ENABLED` gate nothing today because no
+    gateway exists: no app prompt, turn update, or LLM analysis path reads
+    the store. They exist so a future gateway must flip explicit flags
+    before any behavior change (plan 19.4).
 - **Work decisions (0.5.0)**, refining unspecified plan details:
   - The critical-shutdown "emergency-work override" (plan 25.1) has no
     env field in the section 8.3 inventory, so it is not implemented;
@@ -171,14 +271,18 @@ decisions (plan section 2). Milestones implemented: **0.1.0** through
 
 ### Heartbeats
 
-- `initiative_counter` in `heartbeat_ack` is the constant `0`. The initiative
-  engine ships in milestone 0.7.0; the field exists now for wire stability.
+- With `INITIATIVE_ENABLED=false` (default), `initiative_counter` in
+  `heartbeat_ack` is the constant `0` and no initiative key is created.
+  When enabled, the ack carries the owner's live heartbeat count after
+  this heartbeat's bucket claim (see the 0.7.0 decisions above).
 - `heartbeat_ack` carries an extra boolean `counted`: `false` for
   replayed/out-of-order sequences (acked but flagged, per plan 10.8). This is
   additive metadata, not a shape change.
 - Heartbeats are handled inline on the reader loop and never touch the
   per-owner turn lock; turns run in background tasks precisely so acks are
-  served while a turn is active.
+  served while a turn is active. Initiative counting is also lock-scoped
+  (initiative lock) and delivery runs as a background task, so a pending
+  initiative never blocks an ack or a turn.
 - Heartbeat `timezone` updates connection-local context only.
 
 ### Language pin (plan 7.4, milestone 0.2.0 scope)
@@ -825,7 +929,7 @@ integration tests):
   requests and replay scripted responses.
 - HTTP+WS tests use FastAPI's `TestClient`; no network, no live Redis.
 
-## Redis keys in 0.1.0–0.6.0
+## Redis keys in 0.1.0–0.7.0
 
 `core:history:{owner}:companion` (list of JSON rows: `id`, `role`, `text`,
 `emotion`, `ts`, `delivery_state`) is the only key a flags-off deployment
@@ -846,11 +950,11 @@ ON): `core:sessions:{owner}`, `core:projects:{owner}`,
 `core:mcp_response:{owner}:{request_id}` /
 `core:device_response:{owner}:{request_id}` (deleted after consumption),
 and `core:device:audit:{owner}` (metadata only; `DEVICE_ENABLED`).
-With 0.6.0: `core:midterm:{owner}:companion` (bounded chapter ring; appears once compaction first stores a chapter), `core:daily:reminders:{owner}` (DAILY_TOOLS_ENABLED reminder writes), and `core:daily:idempotency:{owner}` (executed mutation keys). `core:longterm:{owner}` rows beyond character life events appear when extraction or admin CRUD writes durable facts. **Audio is never stored server-side** —
+With 0.6.0: `core:midterm:{owner}:companion` (bounded chapter ring; appears once compaction first stores a chapter), `core:daily:reminders:{owner}` (DAILY_TOOLS_ENABLED reminder writes), and `core:daily:idempotency:{owner}` (executed mutation keys). `core:longterm:{owner}` rows beyond character life events appear when extraction or admin CRUD writes durable facts. With 0.7.0: `core:initiative:{owner}` (HEARTBEAT_ENABLED + INITIATIVE_ENABLED heartbeat counting) and `core:external_profile:{owner}:{platform}:{external_id}` (EXTERNAL_USER_PROFILE_STORE_ENABLED admin CRUD; no keys when the store is disabled). **Audio is never stored server-side** —
 audio bytes exist only in flight, and the STT/TTS paths write no keys. All
 other keys in plan section 28 belong to later milestones.
 
 ## Version source
 
-`core/constants.py::VERSION = "0.6.0"` is the single source; the entrypoint
+`core/constants.py::VERSION = "0.7.0"` is the single source; the entrypoint
 docstring, README, `connected` frame, and `/status` derive from it.

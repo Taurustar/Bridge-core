@@ -78,6 +78,7 @@ class ConnectionManager:
         self._profile_locks: dict[str, asyncio.Lock] = {}
         self._catchup_locks: dict[str, asyncio.Lock] = {}
         self._session_locks: dict[str, asyncio.Lock] = {}
+        self._initiative_locks: dict[str, asyncio.Lock] = {}
         self._pending: dict[str, PendingRequest] = {}
 
     def connect(
@@ -163,6 +164,19 @@ class ConnectionManager:
         if lock is None:
             lock = asyncio.Lock()
             self._session_locks[session_id] = lock
+        return lock
+
+    def initiative_lock(self, user_id: str) -> asyncio.Lock:
+        """Per-owner initiative lock (plan section 23.3).
+
+        Serializes heartbeat counting and delivery accounting so concurrent
+        device heartbeats cannot double-count. Separate from the turn lock,
+        the catch-up lock, and the profile lock (plan section 11).
+        """
+        lock = self._initiative_locks.get(user_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._initiative_locks[user_id] = lock
         return lock
 
     async def fan_out(

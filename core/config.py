@@ -268,6 +268,8 @@ class Config:
     INITIATIVE_DAILY_MAX: int = 3
     INITIATIVE_REQUIRE_SCHEDULE_FREE: bool = True
     INITIATIVE_ELIGIBILITY_CHANCE: float = 0.35
+    INITIATIVE_RESPECT_OWNER_SCHEDULE: bool = False
+    INITIATIVE_SEED_FILE: str = ""
 
     # Work and MCP
     WORK_ENABLED: bool = True
@@ -473,6 +475,22 @@ class Config:
             raise ConfigError("DAILY_WEB_TIMEOUT must be positive")
         if self.DAILY_WEB_SEARCH_CAP < 0 or self.DAILY_WEB_OPEN_CAP < 0:
             raise ConfigError("DAILY_WEB_SEARCH_CAP and DAILY_WEB_OPEN_CAP must be >= 0")
+        if self.INITIATIVE_MIN_HEARTBEATS < 1:
+            raise ConfigError("INITIATIVE_MIN_HEARTBEATS must be at least 1")
+        for initiative_seconds in (
+            "INITIATIVE_HEARTBEAT_WINDOW_SECONDS",
+            "INITIATIVE_HEARTBEAT_COUNT_INTERVAL_SECONDS",
+        ):
+            if getattr(self, initiative_seconds) < 1:
+                raise ConfigError(f"{initiative_seconds} must be at least 1")
+        if self.INITIATIVE_MIN_GAP_SECONDS < 0:
+            raise ConfigError("INITIATIVE_MIN_GAP_SECONDS must be >= 0")
+        if self.INITIATIVE_DAILY_MAX < 0:
+            raise ConfigError("INITIATIVE_DAILY_MAX must be >= 0")
+        if not (0.0 <= self.INITIATIVE_ELIGIBILITY_CHANCE <= 1.0):
+            raise ConfigError(
+                "INITIATIVE_ELIGIBILITY_CHANCE must be between 0 and 1"
+            )
         if unknown:
             raise ConfigError(
                 f"LLM_CHAIN contains unknown providers: {', '.join(unknown)}"

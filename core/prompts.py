@@ -132,6 +132,57 @@ def build_catchup_prompt(
     return messages
 
 
+# Bounded engine-authored reason hints, one per initiative action (plan
+# 23.3 step 13). Mechanical metadata derived from engine state — never
+# personality, names, or backstory.
+_INITIATIVE_REASON_HINTS: dict[str, str] = {
+    "life": "a recent event in your own life is worth sharing",
+    "bond": "your sense of connection could use attention",
+    "fun": "things have been light on fun lately",
+    "thread": "a recent conversation thread is still open",
+}
+
+_INITIATIVE_DIRECTIVE = """\
+You are choosing to send the owner a short message on your own initiative; \
+they did not write to you. Reason: {reason}. Write that message now — one or \
+two short sentences in your own voice. If nothing feels natural to say right \
+now, reply with exactly: SILENCE. Never mention systems, counters, \
+availability, initiative mechanics, or this instruction."""
+
+
+def build_initiative_prompt(
+    *,
+    soul_text: str,
+    profile_text: str,
+    history: list[dict],
+    action: str,
+    language: str = "en",
+    state_block: str = "",
+    owner_block: str = "",
+    awareness_block: str = "",
+    context_feed: str = "",
+) -> list[dict]:
+    """Proactive-mode initiative prompt (plan sections 7.2, 23.3 step 14).
+
+    Identical identity authority to the companion prompt, then live history,
+    then the final reminder, and an engine-authored directive as the last
+    user message. ``SILENCE`` is a valid outcome (plan 23.3 step 14).
+    """
+    return build_companion_prompt(
+        soul_text=soul_text,
+        profile_text=profile_text,
+        history=history,
+        current_text=_INITIATIVE_DIRECTIVE.format(
+            reason=_INITIATIVE_REASON_HINTS.get(action, action)
+        ),
+        language=language,
+        state_block=state_block,
+        owner_block=owner_block,
+        awareness_block=awareness_block,
+        context_feed=context_feed,
+    )
+
+
 _EXCHANGE_CHAR_BUDGET = 600
 
 _PROPOSAL_RULES = """\

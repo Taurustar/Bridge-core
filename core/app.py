@@ -93,6 +93,7 @@ def create_app(
                 or path.startswith("/history/")
                 or path == "/memories"
                 or path.startswith("/memories/")
+                or path.startswith("/profiles/external")
                 or path.startswith("/admin/wipe/")
             )
             if not scoped:
@@ -223,6 +224,20 @@ def create_app(
                 "web": bridge.web.available(),
                 "max_calls": cfg.DAILY_TOOL_MAX_CALLS,
             },
+            "initiative": {
+                "enabled": bridge.initiative.available,
+                "min_heartbeats": cfg.INITIATIVE_MIN_HEARTBEATS,
+                "daily_max": cfg.INITIATIVE_DAILY_MAX,
+                "min_gap_seconds": cfg.INITIATIVE_MIN_GAP_SECONDS,
+                "eligibility_chance": cfg.INITIATIVE_ELIGIBILITY_CHANCE,
+                "require_schedule_free": cfg.INITIATIVE_REQUIRE_SCHEDULE_FREE,
+                "respect_owner_schedule": cfg.INITIATIVE_RESPECT_OWNER_SCHEDULE,
+            },
+            "external_profiles": {
+                "store": cfg.EXTERNAL_USER_PROFILE_STORE_ENABLED,
+                "behavior": cfg.EXTERNAL_USER_PROFILES_BEHAVIOR_ENABLED,
+                "llm_analysis": cfg.EXTERNAL_USER_PROFILE_LLM_ENABLED,
+            },
             "user_schedule": {
                 "enabled": bridge.user_schedule.available,
             },
@@ -245,6 +260,7 @@ def create_app(
         return bridge.emotions_manifest
 
     from .routes.admin import register_admin_routes
+    from .routes.external_profiles import register_external_profile_routes
     from .routes.history import register_history_routes
     from .routes.life import register_life_routes
     from .routes.memories import register_memory_routes
@@ -262,14 +278,18 @@ def create_app(
     register_session_routes(app, bridge)
     register_history_routes(app, bridge)
     register_memory_routes(app, bridge)
+    register_external_profile_routes(app, bridge)
     register_admin_routes(app, bridge)
 
     @app.post("/message")
     async def message(request: Request):
         """Minimal HTTP webhook for text companion turns (plan section 10.10).
 
-        Full webhook completion (message_ack reconciliation, tool-less work
-        turns) is milestone 0.7.0 — documented in BRIDGE_CORE_ENGINE_SPEC.md.
+        HTTP-originated turns never invoke MCP or the device daemon because
+        there is no originating WS connection with execution authority; a
+        work request needing tools answers the deterministic
+        ``tools_require_websocket`` error. Uncertain delivery is reconciled
+        by the WS ``message_ack`` frame, not this route.
         """
         try:
             body = await request.json()

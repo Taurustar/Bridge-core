@@ -1,10 +1,12 @@
-"""Bridge: wiring and companion turn lifecycle (plan sections 10-12, 14-18, 20-22).
+"""Bridge: wiring and companion turn lifecycle (plan sections 10-12, 14-18, 20-23).
 
 Holds the config, cache, connection manager, LLM router, speech services, the
 0.3.0 needs/interaction/owner-profile engines, the 0.4.0 schedule, life,
-awareness, catch-up, and contextual owner-schedule engines, and the 0.6.0
+awareness, catch-up, and contextual owner-schedule engines, the 0.6.0
 three-tier memory backend (mid-term compaction, extraction, session close),
-private daily tools, and the Tavily web tool.
+private daily tools, the Tavily web tool, and the 0.7.0 heartbeat-initiative
+engine (counting, cadence roll, delivery accounting) plus delivery
+reconciliation (startup pending -> delivery_unknown, message_ack -> delivered).
 
 validate owner -> non-empty text -> soft-block gate (plan 12 step 5; while
 blocked: one authored distance line per cooldown, no LLM/bids/history writes)
@@ -22,12 +24,17 @@ from future prompts -> release lock -> optional catch-up of held companion
 messages -> strict-JSON owner-profile analysis (flag-gated, background) ->
 pipelined sequential TTS chunks to the source connection only.
 
+Heartbeats are counted inline per valid sequence (owner-global buckets under
+the initiative lock, plan 23.3) and never touch the turn lock; a candidate
+initiative generates and delivers in a background task under the turn lock,
+and counters advance only after source delivery plus delivered-history
+persistence.
+
 Every turn terminates with a ``done`` frame or a terminal error frame (plan
 section 30.2). Empty/failed STT returns a localized static line (or
 protocol-only metadata) with a terminal ``done`` and makes no LLM/history
 call. Catch-up runs under its own per-owner lock and only when availability
-is free/soft_busy; work/companion deferred entries stay separated by mode
-(work itself ships in 0.5.0).
+is free/soft_busy; work/companion deferred entries stay separated by mode.
 """
 
 from __future__ import annotations
@@ -57,7 +64,9 @@ from .constants import (
     HEARTBEAT_MAX_AGE_SECONDS,
     HEARTBEAT_MAX_FUTURE_SECONDS,
     INITIATIVE_COUNTER_STUB,
+    INITIATIVE_THREAD_WINDOW_SECONDS,
     PAUSE_STATUSES,
+    PENDING_UNKNOWN_THRESHOLD_SECONDS,
     RUN_STATES,
     STATUS_TO_EMOTION,
     SUPPORTED_LANGUAGES,
@@ -80,7 +89,24 @@ from .daily_tools import (
 )
 from .device import DeviceManager
 from .emotions import load_emotions_manifest
+from .external_profiles import ExternalProfileStore
 from .interaction import DeferredQueue
+from .initiative import (
+    BID_KIND_BY_ACTION,
+    InitiativeEngine,
+    REASON_ACTIVE_TURN,
+    REASON_DELIVERED,
+    REASON_LLM_FAILED,
+    REASON_NO_REASON,
+    REASON_NO_TARGET,
+    REASON_OWNER_SCHEDULE,
+    REASON_NEEDS,
+    REASON_SCHEDULE,
+    REASON_SILENCE,
+    REASON_SOFT_BLOCK,
+    REASON_UNDELIVERED,
+    SeedUnavailable,
+)
 from .life import LifeEngine
 from .llm import LLMChainExhausted, LLMResult, LLMRouter, ProviderRoute
 from .mcp import MCPProxy, parse_tool_name
@@ -97,6 +123,7 @@ from .owner_profile import (
 from .prompts import (
     build_catchup_prompt,
     build_companion_prompt,
+    build_initiative_prompt,
     build_owner_profile_analysis_prompt,
     build_session_summary_prompt,
     build_work_catchup_prompt,
@@ -231,6 +258,8 @@ class Bridge:
         self.sessions = SessionStore(config, cache)
         self.mcp = MCPProxy(config, cache, self.connections)
         self.device = DeviceManager(config, cache, self.connections)
+        self.initiative = InitiativeEngine(config, cache)
+        self.external_profiles = ExternalProfileStore(config, cache)
         self.schedule: Schedule | None = None
         self.life: LifeEngine | None = None
         self.emotions_manifest: dict = {}
@@ -294,6 +323,33 @@ class Bridge:
                 "LIFE_ENABLED requires SCHEDULE_ENABLED (life generates at "
                 "block entry); life stays inert"
             )
+        # Plan 12 crash recovery: assistant rows left pending beyond a short
+        # threshold become delivery_unknown, never silently delivered or
+        # undelivered. A matching message_ack moves them back to delivered.
+        await self._reconcile_startup_pending(self.config.OWNER_USER_ID)
+
+    async def _reconcile_startup_pending(self, owner: str) -> None:
+        try:
+            async with self.connections.turn_lock(owner):
+                rows = await hist.load_rows(self.cache, owner)
+                now_ts = time.time()
+                for index, row in enumerate(rows):
+                    if row.get("role") != "assistant":
+                        continue
+                    if row.get("delivery_state") != hist.PENDING:
+                        continue
+                    try:
+                        row_ts = datetime.fromisoformat(str(row.get("ts", "")))
+                    except (ValueError, TypeError):
+                        continue
+                    if (now_ts - row_ts.timestamp()) < PENDING_UNKNOWN_THRESHOLD_SECONDS:
+                        continue
+                    row["delivery_state"] = hist.DELIVERY_UNKNOWN
+                    await self.cache.set_row(
+                        hist.companion_history_key(owner), index, json.dumps(row)
+                    )
+        except Exception:  # noqa: BLE001 - reconciliation never blocks startup
+            log.warning("Startup pending-row reconciliation failed", exc_info=True)
 
     def capabilities(self) -> list[str]:
         """What this build actually supports right now (see SPEC)."""
@@ -325,7 +381,8 @@ class Bridge:
             "chroma": cfg.CHROMA_ENABLED,
             "daily_tools": cfg.DAILY_TOOLS_ENABLED,
             "daily_web": self.web.available(),
-            "initiative": cfg.INITIATIVE_ENABLED,
+            "initiative": self.initiative.available,
+            "external_profile_store": self.external_profiles.available,
             "device": cfg.DEVICE_ENABLED,
             "user_schedule": cfg.USER_SCHEDULE_ENABLED,
         }
@@ -446,10 +503,16 @@ class Bridge:
         elif frame_type == "audio":
             await self._handle_audio_frame(conn, frame)
         elif frame_type == "message_ack":
-            # Delivery reconciliation for delivery_unknown rows arrives with
-            # the history APIs milestone; acknowledgements are accepted and
-            # idempotently ignored in 0.1.0 (documented in SPEC).
-            log.debug("message_ack ignored (no pending reconciliation)")
+            # Delivery reconciliation (plan sections 10.10, 12): a matching
+            # pending/delivery_unknown assistant row becomes delivered.
+            # Unknown ids and duplicates are accepted and idempotent.
+            message_id = frame.get("id")
+            if isinstance(message_id, str) and message_id.strip():
+                ack_task = asyncio.create_task(
+                    self._reconcile_message_ack(conn.user_id, message_id.strip())
+                )
+                self.background_tasks.add(ack_task)
+                ack_task.add_done_callback(self.background_tasks.discard)
         elif frame_type == "mcp_result":
             self.mcp.handle_result(conn, frame)
         elif frame_type == "device_tool_result":
@@ -794,14 +857,33 @@ class Bridge:
             log.debug(
                 "Replayed/out-of-order heartbeat sequence on %s", conn.connection_id
             )
-        # The initiative engine is milestone 0.7.0; the counter is a constant
-        # stub until then (documented in SPEC). Replay flagging exists now so
-        # clients see stable semantics.
+
+        # Initiative counting (plan section 23). Counting never takes the
+        # per-owner turn lock, so heartbeats stay acknowledged while another
+        # turn is active (plan section 11). Replayed/out-of-order sequences
+        # are acked but never count. When the engine is disabled no key is
+        # created and the ack keeps the constant stub counter.
+        counter = INITIATIVE_COUNTER_STUB
+        candidate: dict | None = None
+        if self.initiative.available and counted:
+            try:
+                async with self.connections.initiative_lock(conn.user_id):
+                    outcome = await self.initiative.count(
+                        conn.user_id, conn.connection_id
+                    )
+                counter = outcome["heartbeat_count"]
+                if outcome["candidate"]:
+                    candidate = outcome
+            except SeedUnavailable:
+                log.warning("Initiative seed unusable; engine stays idle")
+            except Exception:  # noqa: BLE001 - counting never fails acks
+                log.debug("initiative counting failed", exc_info=True)
+
         await conn.send_json(
             {
                 "type": "heartbeat_ack",
                 "server_time": hist.utc_now_iso(),
-                "initiative_counter": INITIATIVE_COUNTER_STUB,
+                "initiative_counter": counter,
                 "counted": counted,
             }
         )
@@ -828,12 +910,265 @@ class Bridge:
                 work_catchup_task.add_done_callback(
                     self.background_tasks.discard
                 )
+        # Delivery (plan 23.3 steps 9-16) runs as a background task so the
+        # reader loop never waits on LLM generation.
+        if candidate is not None:
+            initiative_task = asyncio.create_task(
+                self._deliver_initiative(conn.user_id, candidate)
+            )
+            self.background_tasks.add(initiative_task)
+            initiative_task.add_done_callback(self.background_tasks.discard)
 
     async def _sweep_bids(self, owner_id: str) -> None:
         try:
             await self.bids.sweep_expired(owner_id)
         except Exception:  # noqa: BLE001 - maintenance never fails heartbeats
             log.debug("bid sweep failed", exc_info=True)
+
+    # -- heartbeat initiative delivery (plan section 23) ---------------------------
+
+    async def _deliver_initiative(self, owner: str, candidate: dict) -> None:
+        """Generate and deliver one initiative (plan 23.3 steps 9-16).
+
+        Never raises. The expensive gates re-run here because connection and
+        turn state may have moved since counting. Generation and the
+        section 12 pending/delivery protocol run under the per-owner turn
+        lock; counter accounting runs only after source delivery AND
+        delivered-history persistence both succeed.
+        """
+        try:
+            stop_action, stop_reason = await self._initiative_gates(owner)
+            if stop_reason:
+                await self.initiative.note_decision(owner, stop_action, stop_reason)
+                return
+
+            target = self._initiative_target(owner, candidate)
+            if target is None:
+                await self.initiative.note_decision(owner, "no_action", REASON_NO_TARGET)
+                return
+
+            action = await self._select_initiative_action(owner)
+            if action is None:
+                await self.initiative.note_decision(owner, "no_action", REASON_NO_REASON)
+                return
+
+            language = (
+                await self._owner_preferred_language() or self.config.DEFAULT_LANGUAGE
+            )
+            delivered = False
+            async with self.connections.turn_lock(owner):
+                prompt_history = await hist.load_prompt_history(
+                    self.cache, owner, self.config.LLM_HISTORY_MESSAGE_BUDGET
+                )
+                blocks = await self._build_prompt_blocks(
+                    owner, source_conn=target, prompt_history=prompt_history
+                )
+                messages = build_initiative_prompt(
+                    soul_text=self._read_identity("soul"),
+                    profile_text=self._read_identity("profile"),
+                    history=prompt_history,
+                    action=action,
+                    language=language,
+                    state_block=blocks["state_block"],
+                    owner_block=blocks["owner_block"],
+                    awareness_block=blocks["awareness_block"],
+                    context_feed=blocks["context_feed"] or blocks["chapter_block"],
+                )
+                result = await self.llm.chat("proactive", messages)
+                segments = parse_emotion_segments(result.text)
+                if _is_silence(segments):
+                    await self.initiative.note_decision(
+                        owner, "no_action", REASON_SILENCE
+                    )
+                    log.info("Initiative resolved to silence")
+                    return
+                reply_text = join_segments(segments)
+                emotion = segments[0]["emotion"]
+                assistant_row = hist.make_row(
+                    "assistant", reply_text, hist.PENDING, emotion=emotion
+                )
+                assistant_row["initiated_by"] = "character"
+                assistant_row["initiative"] = True
+                assistant_row["initiative_action"] = action
+                await hist.append_row(
+                    self.cache, owner, assistant_row, self.config.MAX_HISTORY_TURNS
+                )
+                done: dict[str, Any] = {
+                    "type": "done",
+                    "id": assistant_row["id"],
+                    "text": reply_text,
+                    "emotion": emotion,
+                    "segments": [dict(segment) for segment in segments],
+                    "mode": "companion",
+                    "provider": result.provider,
+                    "model": result.model,
+                    "initiative": True,
+                    "initiative_action": action,
+                    "initiated_by": "character",
+                }
+                if result.usage:
+                    done["tokens"] = {
+                        "prompt": result.usage.get("prompt_tokens", 0),
+                        "completion": result.usage.get("completion_tokens", 0),
+                        "total": result.usage.get("total_tokens", 0),
+                    }
+                delivered = await target.send_json(done)
+                if delivered:
+                    await hist.mark_delivery_state(
+                        self.cache, owner, assistant_row["id"], hist.DELIVERED
+                    )
+                    await self._fan_out(
+                        owner,
+                        self._chat_sync(assistant_row, "character", target),
+                        exclude=target,
+                    )
+                else:
+                    await hist.mark_delivery_state(
+                        self.cache, owner, assistant_row["id"], hist.UNDELIVERED
+                    )
+
+            if delivered:
+                # Plan 23.3 step 16: accounting and the connection bid are
+                # registered only after confirmed delivery + persistence.
+                async with self.connections.initiative_lock(owner):
+                    await self.initiative.record_delivery(owner)
+                await self.initiative.note_decision(owner, action, REASON_DELIVERED)
+                if self.bids.available:
+                    try:
+                        lifetime = float(
+                            self.needs.bid_config().get(
+                                "open_bid_lifetime_seconds", 1209600.0
+                            )
+                        )
+                        await self.bids.register_bid(
+                            owner,
+                            BID_KIND_BY_ACTION[action],
+                            lifetime_seconds=lifetime,
+                        )
+                    except Exception:  # noqa: BLE001
+                        log.debug("initiative bid registration failed", exc_info=True)
+                log.info("Initiative delivered (action=%s)", action)
+            else:
+                await self.initiative.note_decision(owner, action, REASON_UNDELIVERED)
+        except LLMChainExhausted:
+            await self.initiative.note_decision(owner, "no_action", REASON_LLM_FAILED)
+            log.warning("Initiative generation failed; no delivery, no accounting")
+        except Exception:  # noqa: BLE001 - initiative never crashes the bridge
+            log.debug("initiative delivery failed", exc_info=True)
+
+    async def _initiative_gates(self, owner: str) -> tuple[str, str]:
+        """Plan 23.3 steps 9-12. Returns (action, stop_reason); an empty
+        reason means every gate passed."""
+        # Step 9: any owner connection with an active turn suppresses.
+        if self.connections.turn_lock(owner).locked():
+            return "no_action", REASON_ACTIVE_TURN
+        # Step 10: character schedule availability per config.
+        availability = await self._effective_availability(owner)
+        allowed = ("free",) if self.config.INITIATIVE_REQUIRE_SCHEDULE_FREE else (
+            "free",
+            "soft_busy",
+        )
+        if availability not in allowed:
+            return "no_action", REASON_SCHEDULE
+        # Step 11: critical needs or owner-profile soft block suppress.
+        if self.needs.available:
+            try:
+                snapshot = await self.needs.peek(owner)
+                if snapshot.get("shutdown") or any(
+                    zone in ("critical", "deprived")
+                    for zone in snapshot.get("zones", {}).values()
+                ):
+                    return "no_action", REASON_NEEDS
+            except Exception:  # noqa: BLE001 - advisory gate
+                log.debug("needs peek for initiative failed", exc_info=True)
+        if self.owner_profile.available and self.config.OWNER_SOFT_BLOCK_ENABLED:
+            status = await self.owner_profile.soft_block_status(owner)
+            if status.get("blocked"):
+                return "no_action", REASON_SOFT_BLOCK
+        # Step 12: optional contextual owner-schedule suppression.
+        if self.config.INITIATIVE_RESPECT_OWNER_SCHEDULE and self.user_schedule.available:
+            block = await self.user_schedule.current_block(owner)
+            if block is not None and block.get("state") in ("sleep", "busy"):
+                return "no_action", REASON_OWNER_SCHEDULE
+        return "", ""
+
+    def _initiative_target(self, owner: str, candidate: dict) -> Connection | None:
+        """Plan 23.3 target rule: the first valid sender of the
+        threshold-crossing bucket if still connected and turn-free,
+        otherwise the most recently active valid owner connection."""
+        conns = self.connections.connections_for(owner)
+        if not conns:
+            return None
+        threshold_id = str(candidate.get("target_connection_id", "") or "")
+        if threshold_id and not self.connections.turn_lock(owner).locked():
+            for conn in conns:
+                if conn.connection_id == threshold_id:
+                    return conn
+        return max(conns, key=lambda c: c.last_activity_ts)
+
+    async def _select_initiative_action(self, owner: str) -> str | None:
+        """Deterministic reason selection (plan 23.3 step 13).
+
+        Priority: pending life mention, bond need, low fun, recent open
+        thread. ``None`` when nothing justifies speaking.
+        """
+        if self.life is not None and self.life.available:
+            try:
+                if await self.life.pending_ids(owner):
+                    return "life"
+            except Exception:  # noqa: BLE001
+                log.debug("life pending check failed", exc_info=True)
+        if self.needs.available:
+            try:
+                snapshot = await self.needs.peek(owner)
+                zones = snapshot.get("zones", {})
+                if zones.get("bond") in ("strained", "deprived"):
+                    return "bond"
+                if zones.get("fun") in ("low", "critical"):
+                    return "fun"
+            except Exception:  # noqa: BLE001
+                log.debug("needs peek for reason failed", exc_info=True)
+        try:
+            rows = await hist.load_rows(self.cache, owner)
+            for row in reversed(rows):
+                if row.get("delivery_state") != hist.DELIVERED:
+                    continue
+                try:
+                    row_ts = datetime.fromisoformat(str(row.get("ts", "")))
+                except (ValueError, TypeError):
+                    continue
+                if time.time() - row_ts.timestamp() <= INITIATIVE_THREAD_WINDOW_SECONDS:
+                    return "thread"
+                break
+        except Exception:  # noqa: BLE001
+            log.debug("thread reason check failed", exc_info=True)
+        return None
+
+    # -- delivery reconciliation (plan sections 10.10, 12) --------------------------
+
+    async def _reconcile_message_ack(self, owner: str, message_id: str) -> None:
+        """A client acknowledgement moves a ``pending``/``delivery_unknown``
+        assistant row to delivered (plan section 12 crash recovery).
+        Idempotent: unknown ids and already-delivered rows change nothing."""
+        try:
+            async with self.connections.turn_lock(owner):
+                rows = await hist.load_rows(self.cache, owner)
+                for index, row in enumerate(rows):
+                    if row.get("id") != message_id:
+                        continue
+                    if row.get("delivery_state") not in (
+                        hist.PENDING,
+                        hist.DELIVERY_UNKNOWN,
+                    ):
+                        return
+                    row["delivery_state"] = hist.DELIVERED
+                    await self.cache.set_row(
+                        hist.companion_history_key(owner), index, json.dumps(row)
+                    )
+                    log.info("message_ack marked %s delivered", message_id)
+                    return
+        except Exception:  # noqa: BLE001 - reconciliation never fails the reader
+            log.debug("message_ack reconciliation failed", exc_info=True)
 
     # -- companion turn -----------------------------------------------------------
 
@@ -2723,7 +3058,7 @@ class Bridge:
         origin: str | None = None,
         mode: str = "companion",
     ) -> dict:
-        return {
+        frame: dict[str, Any] = {
             "type": "chat_sync",
             "role": row["role"],
             "text": row["text"],
@@ -2737,6 +3072,12 @@ class Bridge:
             ),
             "ts": row["ts"],
         }
+        # Initiative origin metadata rides along additively (plan section
+        # 23.5); user replies never carry it because their rows never do.
+        if row.get("initiative"):
+            frame["initiative"] = True
+            frame["initiative_action"] = row.get("initiative_action", "")
+        return frame
 
     async def _fan_out(self, owner: str, frame: dict, exclude: Connection | None = None) -> None:
         try:
@@ -2772,6 +3113,17 @@ class Bridge:
 
 def _has_spoken_text(segments: list[dict]) -> bool:
     return any(str(segment.get("text", "")).strip() for segment in segments)
+
+
+def _is_silence(segments: list[dict]) -> bool:
+    """Proactive-mode silence (plan 23.3 step 14): no spoken text at all,
+    or the literal token SILENCE as the only spoken content."""
+    spoken = " ".join(
+        str(segment.get("text", "")).strip() for segment in segments
+    ).strip()
+    if not spoken:
+        return True
+    return spoken.strip("[].!? \n").upper() == "SILENCE"
 
 
 def _parse_pause_status(text: str) -> str | None:

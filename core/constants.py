@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-VERSION = "0.6.0"
+VERSION = "0.7.0"
 
 # ---------------------------------------------------------------------------
 # Emotion palette (plan section 13.1). The v1 palette is fixed for wire
@@ -113,9 +113,17 @@ LLM_PROVIDERS: tuple[str, ...] = ("fireworks", "chutes", "ollama", "openai_compa
 HEARTBEAT_MAX_FUTURE_SECONDS = 60
 HEARTBEAT_MAX_AGE_SECONDS = 600
 
-# The initiative engine ships in milestone 0.7.0; the heartbeat ack carries a
-# constant counter until then (documented in BRIDGE_CORE_ENGINE_SPEC.md).
+# Without the initiative engine enabled the heartbeat ack carries this
+# constant counter (documented in BRIDGE_CORE_ENGINE_SPEC.md). When enabled,
+# the ack carries the owner's live heartbeat count.
 INITIATIVE_COUNTER_STUB = 0
+
+# Initiative cadence bounds that the plan leaves unnamed (plan section 23).
+# A "recent open thread" reason looks for delivered companion history within
+# this window; assistant rows left pending longer than the crash-recovery
+# threshold become delivery_unknown at startup (plan section 12).
+INITIATIVE_THREAD_WINDOW_SECONDS = 48 * 3600
+PENDING_UNKNOWN_THRESHOLD_SECONDS = 60
 
 # ---------------------------------------------------------------------------
 # Redis keys (plan section 28). Milestones 0.1.0-0.2.0 may create exactly one
@@ -150,11 +158,16 @@ def owner_profile_key(owner_user_id: str) -> str:
 # It is an obvious-to-a-human string, not a secret; it is never logged at INFO.
 UPDATE_OWNER_PROFILE_TOKEN = "UPDATE_OWNER_PROFILE"
 
+# Dormant external-profile PATCH guard (plan 19.5 requires a confirm token
+# but names no constant; recorded in BRIDGE_CORE_ENGINE_SPEC.md).
+UPDATE_EXTERNAL_PROFILE_TOKEN = "UPDATE_EXTERNAL_PROFILE"
+
 # Confirm tokens (plan section 29). Mistake guards, not authentication.
 GENERATE_LIFE_TOKEN = "GENERATE_LIFE"
 RELOAD_SCHEDULE_TOKEN = "RELOAD_SCHEDULE"
 UPDATE_USER_SCHEDULE_TOKEN = "UPDATE_USER_SCHEDULE"
 DELETE_MEMORY_TOKEN = "DELETE_MEMORY"
+DELETE_EXTERNAL_PROFILE_TOKEN = "DELETE_EXTERNAL_PROFILE"
 WIPE_USER_TOKEN = "WIPE_USER"
 
 # Session-close fan-out frame type (plan section 20.6). The frame shape is
@@ -225,6 +238,16 @@ def reminders_key(owner_user_id: str) -> str:
 def daily_idempotency_key(owner_user_id: str) -> str:
     """Executed daily-tool mutation keys (plan section 24.2)."""
     return f"core:daily:idempotency:{owner_user_id}"
+
+
+def initiative_key(owner_user_id: str) -> str:
+    """Heartbeat-initiative owner counters (plan section 23.2)."""
+    return f"core:initiative:{owner_user_id}"
+
+
+def external_profile_key(owner_user_id: str, platform: str, external_id: str) -> str:
+    """Dormant external-user profile (plan section 19.2)."""
+    return f"core:external_profile:{owner_user_id}:{platform}:{external_id}"
 
 
 def wipe_key_patterns(owner_user_id: str) -> list[str]:
