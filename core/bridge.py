@@ -212,19 +212,30 @@ def error_frame(code: str, message: str, details: dict | None = None, terminal: 
     return frame
 
 
-def status_frame(status: str, message: str | None = None) -> dict:
+def status_frame(
+    status: str,
+    message: str | None = None,
+    *,
+    session_id: str | None = None,
+    run_id: str | None = None,
+) -> dict:
     """Status frame shape of plan section 10.4.
 
     ``message`` is bounded, display-safe engine/UI text — never character
     voice. Status emotions never become final reply emotions.
     """
-    return {
+    frame = {
         "type": "status",
         "status": status,
         "message": message or status.replace("_", " ").capitalize(),
         "emotion": STATUS_TO_EMOTION.get(status, DEFAULT_EMOTION),
         "timestamp": hist.utc_now_iso(),
     }
+    if session_id is not None:
+        frame["session_id"] = session_id
+    if run_id is not None:
+        frame["run_id"] = run_id
+    return frame
 
 
 class Bridge:
@@ -2135,9 +2146,14 @@ class Bridge:
                 )
                 if source_conn is not None:
                     # No done frame on pause (plan 30.2); the status frame
-                    # carries the bounded question text.
+                    # carries the bounded question text and resume ids.
                     await source_conn.send_json(
-                        status_frame(pause_tag, message=paused_text[:200])
+                        status_frame(
+                            pause_tag,
+                            message=paused_text[:200],
+                            session_id=session_id_resolved,
+                            run_id=run_id,
+                        )
                     )
                 return {
                     "type": "paused",

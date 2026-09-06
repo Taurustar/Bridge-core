@@ -831,6 +831,10 @@ integration tests):
 
 ## Milestone 0.5.0 — work mode and device daemon
 
+- Pause status frames (`question` and `request_permission`) carry additive
+  `session_id` and `run_id` fields. A WebSocket client needs both values to
+  resume a newly auto-created run because no `done` frame follows a pause.
+
 ### Work turns (plan sections 12 step 10, 25.1, 25.2)
 
 - `mode: "work"` is accepted on text and audio frames and `POST /message`
