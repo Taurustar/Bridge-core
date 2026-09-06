@@ -3,7 +3,7 @@
 Living implementation contract. It refines unspecified details of
 `BRIDGE_CORE_ENGINE_IMPLEMENTATION_PLAN.md`; it may not override locked
 decisions (plan section 2). Milestones implemented: **0.1.0** through
-**0.7.0**.
+**1.0.0** (release).
 
 ## Deviations from the plan
 
@@ -42,6 +42,11 @@ decisions (plan section 2). Milestones implemented: **0.1.0** through
   Milestone 0.7.0 adds `core/initiative.py` (heartbeat-initiative state,
   counting, cadence roll, delivery accounting) and `core/external_profiles.py`
   plus `core/routes/external_profiles.py` (dormant store and admin APIs).
+  Milestone 1.0.0 adds `deploy/bridge-core-engine.service` (systemd unit),
+  `scripts/validate_config.py` and `scripts/ws_smoke.py` (release tooling),
+  `docs/DEPLOYMENT.md` / `docs/ENVIRONMENT.md` / `docs/OPERATIONS.md` /
+  `docs/RELEASE_AUDIT.md`, and `tests/test_release.py` (release regression
+  pins).
 - **Implementation-specific env fields** (allowed by plan 8.3, documented
   here): `LIFE_SKIP_ACTIVITIES` (comma-separated block activities whose
   entries never generate life events; default `sleep`) and
@@ -213,6 +218,43 @@ decisions (plan section 2). Milestones implemented: **0.1.0** through
     gateway exists: no app prompt, turn update, or LLM analysis path reads
     the store. They exist so a future gateway must flip explicit flags
     before any behavior change (plan 19.4).
+- **Release decisions (1.0.0)**, refining unspecified plan details:
+  - **Chroma executor fix**: the 1.0.0 resource audit found Chroma's
+    blocking calls running on `asyncio.to_thread` (the default multi-thread
+    pool) instead of the dedicated single-thread executor plan 6.1
+    requires. They now run through `chroma_store.run_chroma_call` on one
+    `ThreadPoolExecutor(max_workers=1)` worker per process, serializing
+    Chroma's SQLite-backed client; the worker is joined at interpreter exit
+    by `concurrent.futures`' atexit hook.
+  - **Version source widening**: `pyproject.toml` missed the 0.7.0 bump
+    (still `0.6.0` at release time). `tests/test_release.py` now pins
+    `core.constants.VERSION == pyproject project.version`, so the two
+    sources cannot drift again.
+  - **Documentation enforcement**: release tests assert every `Config`
+    field (and every flag) appears in `docs/ENVIRONMENT.md`, and that every
+    Redis key documented in this SPEC is covered by
+    `constants.wipe_key_patterns` — the "all feature flags and Redis keys
+    documented" acceptance is test-enforced, not prose.
+  - **Excluded-forever enforcement**: release tests scan runtime source
+    (`core/`, `bridge_core.py`) for gateway/public-exposure markers
+    (discord/whatsapp/telegram/funnel) and ban bearer-token auth at the
+    application layer (`core/app.py`, `core/routes/`). Outbound provider
+    `Authorization: Bearer` headers and the memory secret-filter regex are
+    the documented exceptions; they are provider transport, not
+    application auth.
+  - **WS smoke scope**: the smoke script is deliberately turn-less —
+    `/health`, `connected` (version + capabilities), a heartbeat ack, the
+    `bad_json` error path, and optional foreign-user rejection — so a
+    deployment can be verified with no LLM provider configured. Its frame
+    validators are pure functions unit-tested in `tests/test_release.py`.
+  - **systemd stop semantics**: `TimeoutStopSec=30` may SIGKILL a turn
+    still inside the 75s LLM chain deadline. This is safe by construction
+    (user rows persist before provider calls; assistant rows left pending
+    become `delivery_unknown` at the next startup and reconcile via
+    `message_ack`), documented in `docs/OPERATIONS.md` and the audit.
+  - The 1.0.0 commit adds **no new Redis keys, env fields, frames, or
+    routes** — it is hardening, documentation, and enforcement only (plus
+    the Chroma executor fix).
 - **Work decisions (0.5.0)**, refining unspecified plan details:
   - The critical-shutdown "emergency-work override" (plan 25.1) has no
     env field in the section 8.3 inventory, so it is not implemented;
@@ -929,7 +971,7 @@ integration tests):
   requests and replay scripted responses.
 - HTTP+WS tests use FastAPI's `TestClient`; no network, no live Redis.
 
-## Redis keys in 0.1.0–0.7.0
+## Redis keys in 0.1.0–1.0.0
 
 `core:history:{owner}:companion` (list of JSON rows: `id`, `role`, `text`,
 `emotion`, `ts`, `delivery_state`) is the only key a flags-off deployment
@@ -956,5 +998,6 @@ other keys in plan section 28 belong to later milestones.
 
 ## Version source
 
-`core/constants.py::VERSION = "0.7.0"` is the single source; the entrypoint
+`core/constants.py::VERSION = "1.0.0"` is the single source; the entrypoint
 docstring, README, `connected` frame, and `/status` derive from it.
+`tests/test_release.py` pins `pyproject.toml` to the same value.

@@ -31,7 +31,7 @@ import uuid
 from .cache import RedisCache
 from .config import Config
 from .constants import longterm_key, midterm_key
-from .chroma_store import ChromaMemoryStore
+from .chroma_store import ChromaMemoryStore, run_chroma_call
 
 log = logging.getLogger("bridge.memory")
 
@@ -562,7 +562,7 @@ class MemoryBackend:
             if self.chroma is not None and self.chroma.available:
                 try:
                     await self.reconcile_owner(owner)
-                    candidates = await asyncio.to_thread(
+                    candidates = await run_chroma_call(
                         self.chroma.query_candidates,
                         owner,
                         str(record.get("text", "")),
@@ -646,8 +646,8 @@ class MemoryBackend:
                 if not self.chroma.available:
                     raise ChromaWipeError("Chroma is unavailable")
                 try:
-                    await asyncio.to_thread(self.chroma.delete_owner, owner)
-                    if await asyncio.to_thread(self.chroma.count, owner):
+                    await run_chroma_call(self.chroma.delete_owner, owner)
+                    if await run_chroma_call(self.chroma.count, owner):
                         raise RuntimeError("Chroma retained owner rows")
                 except Exception as exc:  # noqa: BLE001
                     log.warning("Chroma owner wipe failed; degrading", exc_info=True)
@@ -680,7 +680,7 @@ class MemoryBackend:
         if self.chroma is not None and self.chroma.available:
             try:
                 await self.reconcile_owner(owner)
-                order = await asyncio.to_thread(
+                order = await run_chroma_call(
                     self.chroma.query, owner, query, list(kinds or []), limit * 4
                 )
                 rows_by_id = {
@@ -705,7 +705,7 @@ class MemoryBackend:
         if self.chroma is None or not rows:
             return
         try:
-            await asyncio.to_thread(self.chroma.upsert, owner, rows)
+            await run_chroma_call(self.chroma.upsert, owner, rows)
         except Exception:  # noqa: BLE001 - index-only failure degrades
             log.warning("Chroma upsert failed; degrading", exc_info=True)
             self.chroma.available = False
@@ -733,15 +733,15 @@ class MemoryBackend:
         try:
             desired_ids = {str(row["id"]) for row in rows if row.get("id")}
             stale_ids = (
-                set(await asyncio.to_thread(self.chroma.ids, owner)) - desired_ids
+                set(await run_chroma_call(self.chroma.ids, owner)) - desired_ids
             )
             if stale_ids:
-                await asyncio.to_thread(self.chroma.delete, list(stale_ids))
-                indexed_ids = set(await asyncio.to_thread(self.chroma.ids, owner))
+                await run_chroma_call(self.chroma.delete, list(stale_ids))
+                indexed_ids = set(await run_chroma_call(self.chroma.ids, owner))
                 if stale_ids & indexed_ids:
                     raise RuntimeError("Chroma retained stale rows")
             if rows:
-                await asyncio.to_thread(self.chroma.upsert, owner, rows)
+                await run_chroma_call(self.chroma.upsert, owner, rows)
             self._reconciled_owners.add(owner)
         except Exception:  # noqa: BLE001
             log.warning("Chroma reconciliation failed; degrading", exc_info=True)
@@ -765,8 +765,8 @@ class MemoryBackend:
         if not self.chroma.available:
             raise ChromaDeleteError("Chroma is unavailable")
         try:
-            await asyncio.to_thread(self.chroma.delete, sorted(record_ids))
-            indexed_ids = set(await asyncio.to_thread(self.chroma.ids, owner))
+            await run_chroma_call(self.chroma.delete, sorted(record_ids))
+            indexed_ids = set(await run_chroma_call(self.chroma.ids, owner))
             if record_ids & indexed_ids:
                 raise RuntimeError("Chroma retained deleted rows")
         except Exception as exc:  # noqa: BLE001
