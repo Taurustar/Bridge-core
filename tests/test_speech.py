@@ -23,6 +23,7 @@ from core.speech import (
     TTSError,
     TTSService,
     VoiceProfileError,
+    apply_repeat_variance,
     decode_audio,
     load_voice_profile,
     sniff_audio_type,
@@ -434,6 +435,21 @@ class VoiceProfileTest(unittest.TestCase):
         path = self._write({"version": 1, "emotions": {"happy": {"speed": 5.0}}})
         with self.assertRaises(VoiceProfileError):
             load_voice_profile(path)
+
+    def test_bundled_profile_loads(self):
+        profile = load_voice_profile()
+        self.assertEqual(profile["version"], 1)
+        self.assertIn("happy", profile["emotions"])
+
+    def test_repeat_variance_is_deterministic_after_threshold(self):
+        base = {"stability": 0.5, "similarity_boost": 0.75, "style": 0.0, "speed": 1.08}
+        self.assertEqual(apply_repeat_variance(base, 0), base)
+        self.assertEqual(apply_repeat_variance(base, 1), base)
+        third = apply_repeat_variance(base, 2)
+        self.assertEqual(third, apply_repeat_variance(base, 2))
+        self.assertGreater(third["speed"], base["speed"])
+        self.assertGreater(third["style"], base["style"])
+        self.assertLess(third["stability"], base["stability"])
 
 
 class StaticLinesTest(unittest.TestCase):

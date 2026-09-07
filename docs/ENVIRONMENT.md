@@ -86,7 +86,7 @@ messages), `MEMORY_TEMPERATURE`/`MEMORY_MAX_TOKENS` (0.2/400),
 | `ELEVENLABS_API_KEY` / `ELEVENLABS_URL` / `ELEVENLABS_VOICE_ID` / `ELEVENLABS_MODEL` | `` / `https://api.elevenlabs.io/v1` / `` / `eleven_flash_v2_5` | TTS provider; `capabilities` gains `audio` only when enabled and configured. |
 | `TTS_OUTPUT_FORMAT` | `mp3_44100_128` | Requested audio format. |
 | `TTS_CHUNK_THRESHOLD` / `TTS_CHUNK_SIZE` / `TTS_CHUNK_SPACING_MS` | `150` / `150` / `50` | Segment-to-chunk chunking and pacing. |
-| `TTS_VOICE_PROFILE_FILE` | `` | Optional voice-profile JSON. |
+| `TTS_VOICE_PROFILE_FILE` | `` | Optional voice-profile JSON. Empty loads bundled `core/voice_profile.json` (v1.0.1). |
 | `STT_ENABLED` | `false` | Master STT switch. |
 | `STT_PROVIDER` | `deepgram` | `deepgram` or `assemblyai`. |
 | `STT_LANGUAGE` | `en` | Default transcription language. |

@@ -47,15 +47,21 @@ class ParseSegmentsTest(unittest.TestCase):
         segments = parse_emotion_segments("[EMOTION: ecstatic]\nWheee.")
         self.assertEqual(segments[0]["emotion"], "neutral")
 
-    def test_leading_text_becomes_neutral_segment(self):
+    def test_leading_text_inherits_first_tag(self):
         segments = parse_emotion_segments("Oh hi.\n[EMOTION: happy]\nThere.")
         self.assertEqual(
             segments,
             [
-                {"text": "Oh hi.", "emotion": "neutral"},
+                {"text": "Oh hi.", "emotion": "happy"},
                 {"text": "There.", "emotion": "happy"},
             ],
         )
+
+    def test_new_palette_names_pass_through(self):
+        segments = parse_emotion_segments("[EMOTION: mischievous]\nHeh.")
+        self.assertEqual(segments[0]["emotion"], "mischievous")
+        self.assertEqual(parse_emotion_segments("[EMOTION: focused]\nOk.")[0]["emotion"], "focused")
+        self.assertEqual(parse_emotion_segments("[EMOTION: loving]\nHi.")[0]["emotion"], "loving")
 
     def test_no_tags_single_neutral_segment(self):
         self.assertEqual(

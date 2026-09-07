@@ -262,7 +262,7 @@ class FakeTTS:
     ) -> None:
         self.fail_texts = set(fail_texts)
         self.available_flag = available_flag
-        self.calls: list[tuple[str, str]] = []
+        self.calls: list[tuple[str, str, int]] = []
 
     def available(self) -> bool:
         return self.available_flag
@@ -281,8 +281,8 @@ class FakeTTS:
     def has_voice_profile(self) -> bool:
         return False
 
-    async def synthesize(self, text: str, emotion: str) -> bytes:
-        self.calls.append((text, emotion))
+    async def synthesize(self, text: str, emotion: str, same_run_index: int = 0) -> bytes:
+        self.calls.append((text, emotion, same_run_index))
         if text in self.fail_texts:
             raise TTSError(f"fake tts failure for chunk {text!r}")
         return f"audio:{emotion}:{text}".encode("utf-8")

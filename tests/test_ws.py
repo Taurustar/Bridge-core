@@ -349,8 +349,8 @@ class HttpEndpointsTest(unittest.TestCase):
         app, _, _ = build_app()
         with TestClient(app) as client:
             body = client.get("/emotions").json()
-            self.assertEqual(body["version"], 1)
-            self.assertEqual(len(body["emotions"]), 18)
+            self.assertEqual(body["version"], 2)
+            self.assertEqual(len(body["emotions"]), 21)
             self.assertEqual(
                 body["status_emotions"],
                 ["thinking", "working", "question", "request_permission"],
@@ -556,7 +556,7 @@ class SpeechPipelineTest(unittest.TestCase):
                 self.assertEqual(complete["failed_chunks"], 0)
         # chunking respected per-segment emotions (deterministic order)
         self.assertEqual(
-            [(text, emotion) for text, emotion in tts.calls],
+            [(text, emotion) for text, emotion, _run in tts.calls],
             [("First sentence here.", "happy"), ("Second sentence here now.", "serious")],
         )
         self.assertEqual(list(fake_redis.store.keys()), [companion_history_key("owner")])

@@ -295,10 +295,9 @@ class Bridge:
             self.config.EMOTIONS_FILE or None
         )
         self.tts.attach_manifest(self.emotions_manifest)
-        if self.config.TTS_VOICE_PROFILE_FILE.strip():
-            self.tts.set_voice_profile(
-                load_voice_profile(self.config.TTS_VOICE_PROFILE_FILE.strip())
-            )
+        self.tts.set_voice_profile(
+            load_voice_profile(self.config.TTS_VOICE_PROFILE_FILE.strip() or None)
+        )
         self.static_lines = load_static_lines(self.config.STATIC_LINES_FILE or None)
         # Three-tier memory (plan section 20): the durable Redis store of
         # record plus the optional Chroma index (degraded-safe).
@@ -2991,10 +2990,23 @@ class Bridge:
         spacing = max(self.config.TTS_CHUNK_SPACING_MS, 0) / 1000.0
         on_deck: list[asyncio.Task] = []
 
+        def run_index_for(index: int) -> int:
+            emotion = chunks[index]["emotion"]
+            run = 0
+            cursor = index - 1
+            while cursor >= 0 and chunks[cursor]["emotion"] == emotion:
+                run += 1
+                cursor -= 1
+            return run
+
         def start_next(index: int) -> None:
             on_deck.append(
                 asyncio.create_task(
-                    self.tts.synthesize(chunks[index]["text"], chunks[index]["emotion"])
+                    self.tts.synthesize(
+                        chunks[index]["text"],
+                        chunks[index]["emotion"],
+                        run_index_for(index),
+                    )
                 )
             )
 

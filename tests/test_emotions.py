@@ -16,10 +16,17 @@ from core.emotions import (
 class ManifestTest(unittest.TestCase):
     def test_bundled_manifest_loads_and_covers_palette(self):
         manifest = load_emotions_manifest()
-        self.assertEqual(manifest["version"], 1)
+        self.assertEqual(manifest["version"], 2)
         names = [e["name"] for e in manifest["emotions"]]
-        self.assertEqual(len(names), 18)
-        self.assertEqual(len(set(names)), 18)
+        self.assertEqual(len(names), 21)
+        self.assertEqual(len(set(names)), 21)
+        self.assertIn("mischievous", names)
+        self.assertIn("loving", names)
+        self.assertIn("focused", names)
+        speeds = {e["name"]: e["tts_speed"] for e in manifest["emotions"]}
+        self.assertEqual(speeds["happy"], 1.08)
+        self.assertEqual(speeds["sad"], 0.7)
+        self.assertNotEqual(set(speeds.values()), {1.0})
 
     def test_unknown_emotion_rejected(self):
         manifest = load_emotions_manifest()

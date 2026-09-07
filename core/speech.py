@@ -30,6 +30,13 @@ log = logging.getLogger("bridge.speech")
 # Per-request ElevenLabs timeout. No environment knob exists for it in the
 # plan inventory; documented in BRIDGE_CORE_ENGINE_SPEC.md.
 TTS_REQUEST_TIMEOUT_SECONDS = 60.0
+BUNDLED_VOICE_PROFILE_FILE = Path(__file__).resolve().parent / "voice_profile.json"
+REPEAT_VARIANCE_THRESHOLD = 2
+REPEAT_SPEED_STEP = 0.01
+REPEAT_STYLE_STEP = 0.02
+REPEAT_STABILITY_STEP = 0.01
+REPEAT_SPEED_MIN = 0.7
+REPEAT_SPEED_MAX = 1.2
 
 _AAI_PER_REQUEST_TIMEOUT_SECONDS = 30.0
 
@@ -344,9 +351,24 @@ _DEFAULT_VOICE_SETTINGS: dict[str, Any] = {
 }
 
 
-def load_voice_profile(path: str) -> dict:
-    """Load and validate the configured voice-profile JSON file."""
-    profile_path = Path(path)
+def apply_repeat_variance(settings: dict[str, Any], same_run_index: int) -> dict[str, Any]:
+    """Deterministic nudge after consecutive same-emotion chunks (v1.0.1)."""
+    if same_run_index < REPEAT_VARIANCE_THRESHOLD:
+        return settings
+    step = same_run_index - 1
+    out = dict(settings)
+    speed = float(out.get("speed", 1.0)) + step * REPEAT_SPEED_STEP
+    style = float(out.get("style", 0.0)) + step * REPEAT_STYLE_STEP
+    stability = float(out.get("stability", 0.5)) - step * REPEAT_STABILITY_STEP
+    out["speed"] = min(REPEAT_SPEED_MAX, max(REPEAT_SPEED_MIN, speed))
+    out["style"] = min(1.0, max(0.0, style))
+    out["stability"] = min(1.0, max(0.0, stability))
+    return out
+
+
+def load_voice_profile(path: str | None = None) -> dict:
+    """Load and validate a voice-profile JSON file, or the bundled default."""
+    profile_path = Path(path) if path else BUNDLED_VOICE_PROFILE_FILE
     try:
         data = json.loads(profile_path.read_text(encoding="utf-8"))
     except FileNotFoundError:
@@ -472,7 +494,7 @@ class TTSService:
                 settings["use_speaker_boost"] = boost
         return settings
 
-    async def synthesize(self, text: str, emotion: str) -> bytes:
+    async def synthesize(self, text: str, emotion: str, same_run_index: int = 0) -> bytes:
         """Synthesize one chunk. Raises ``TTSError``; the text reply stands."""
         cfg = self._config
         url = (
@@ -481,7 +503,7 @@ class TTSService:
         body = {
             "text": text,
             "model_id": cfg.ELEVENLABS_MODEL,
-            "voice_settings": self._voice_settings(emotion),
+            "voice_settings": apply_repeat_variance(self._voice_settings(emotion), same_run_index),
         }
         headers = {
             "xi-api-key": cfg.ELEVENLABS_API_KEY.strip(),
