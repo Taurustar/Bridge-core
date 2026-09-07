@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  <strong>Version 1.0.0</strong> — Self-hosted backend for a persistent character companion.<br>
+  <strong>Version 1.0.1</strong> — Self-hosted backend for a persistent character companion.<br>
   <em>Lightweight. General-purpose. Privacy-first.</em>
 </p>
 

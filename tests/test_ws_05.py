@@ -263,6 +263,19 @@ class WorkOverWSTest(unittest.TestCase):
         self.assertIn("no armed device", system)
         self.assertEqual(done["type"], "done")
 
+    def test_pause_status_includes_resume_ids(self):
+        llm = FakeLLM(["[STATUS: question]\nWhich branch should I use?"])
+        app, _, _ = build_app(self._config(), llm)
+        with TestClient(app) as client:
+            with client.websocket_connect("/ws/owner") as ws:
+                ws.receive_json()
+                ws.send_json({"type": "text", "text": "merge it", "mode": "work"})
+                self.assertEqual(ws.receive_json()["status"], "working")
+                paused = receive_until(ws, "status")
+        self.assertEqual(paused["status"], "question")
+        self.assertTrue(paused["session_id"].startswith("ses_"))
+        self.assertTrue(paused["run_id"].startswith("run_"))
+
     def test_work_under_soft_block_over_ws(self):
         from core.constants import UPDATE_OWNER_PROFILE_TOKEN
 

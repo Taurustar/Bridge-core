@@ -44,7 +44,7 @@ class VersionSourcesTest(unittest.TestCase):
             (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
         )
         self.assertEqual(pyproject["project"]["version"], VERSION)
-        self.assertEqual(VERSION, "1.0.0")
+        self.assertEqual(VERSION, "1.0.1")
 
 
 class DocumentationCompletenessTest(unittest.TestCase):

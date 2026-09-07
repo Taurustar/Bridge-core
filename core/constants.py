@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 
 # ---------------------------------------------------------------------------
-# Emotion palette (plan section 13.1). The v1 palette is fixed for wire
-# compatibility; adding/removing/renaming a name requires a manifest
-# protocol-version change.
+# Emotion palette (plan section 13.1). Adding/removing/renaming a name
+# requires a manifest protocol-version change. v1.0.1 is manifest version 2
+# (adds mischievous, loving, focused).
 # ---------------------------------------------------------------------------
 
 FINAL_EMOTIONS: tuple[str, ...] = (
@@ -29,6 +29,9 @@ FINAL_EMOTIONS: tuple[str, ...] = (
     "confident",
     "serious",
     "shy",
+    "mischievous",
+    "loving",
+    "focused",
 )
 
 STATUS_EMOTIONS: tuple[str, ...] = (

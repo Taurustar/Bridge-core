@@ -3,7 +3,7 @@
 Living implementation contract. It refines unspecified details of
 `BRIDGE_CORE_ENGINE_IMPLEMENTATION_PLAN.md`; it may not override locked
 decisions (plan section 2). Milestones implemented: **0.1.0** through
-**1.0.0** (release).
+**1.0.1** (emotion palette v2).
 
 ## Deviations from the plan
 
@@ -218,6 +218,19 @@ decisions (plan section 2). Milestones implemented: **0.1.0** through
     gateway exists: no app prompt, turn update, or LLM analysis path reads
     the store. They exist so a future gateway must flip explicit flags
     before any behavior change (plan 19.4).
+- **Emotion alignment (1.0.1)**, owner-approved palette expansion (plan 13.1
+  otherwise freezes v1 names):
+  - `FINAL_EMOTIONS` gains `mischievous`, `loving`, `focused`. `working`
+    stays status-only. Bundled `core/emotions.json` is **version 2** with
+    21 finals and Akane-shaped `tts_speed` values (not all 1.0).
+  - Parser: text before the first `[EMOTION:]` tag inherits that tag's
+    emotion (was a synthetic `neutral` segment in 1.0.0).
+  - Bundled `core/voice_profile.json` loads when `TTS_VOICE_PROFILE_FILE`
+    is empty. An explicit file still overrides and still fails startup if
+    invalid.
+  - Same-emotion TTS repeat variance: after two consecutive chunks of one
+    emotion, later chunks nudge speed/style/stability deterministically
+    (speed clamped 0.70–1.20). No new frames or env fields.
 - **Release decisions (1.0.0)**, refining unspecified plan details:
   - **Chroma executor fix**: the 1.0.0 resource audit found Chroma's
     blocking calls running on `asyncio.to_thread` (the default multi-thread
@@ -831,6 +844,10 @@ integration tests):
 
 ## Milestone 0.5.0 — work mode and device daemon
 
+- Pause status frames (`question` and `request_permission`) carry additive
+  `session_id` and `run_id` fields. A WebSocket client needs both values to
+  resume a newly auto-created run because no `done` frame follows a pause.
+
 ### Work turns (plan sections 12 step 10, 25.1, 25.2)
 
 - `mode: "work"` is accepted on text and audio frames and `POST /message`
@@ -998,6 +1015,6 @@ other keys in plan section 28 belong to later milestones.
 
 ## Version source
 
-`core/constants.py::VERSION = "1.0.0"` is the single source; the entrypoint
+`core/constants.py::VERSION = "1.0.1"` is the single source; the entrypoint
 docstring, README, `connected` frame, and `/status` derive from it.
 `tests/test_release.py` pins `pyproject.toml` to the same value.

@@ -212,19 +212,30 @@ def error_frame(code: str, message: str, details: dict | None = None, terminal: 
     return frame
 
 
-def status_frame(status: str, message: str | None = None) -> dict:
+def status_frame(
+    status: str,
+    message: str | None = None,
+    *,
+    session_id: str | None = None,
+    run_id: str | None = None,
+) -> dict:
     """Status frame shape of plan section 10.4.
 
     ``message`` is bounded, display-safe engine/UI text — never character
     voice. Status emotions never become final reply emotions.
     """
-    return {
+    frame = {
         "type": "status",
         "status": status,
         "message": message or status.replace("_", " ").capitalize(),
         "emotion": STATUS_TO_EMOTION.get(status, DEFAULT_EMOTION),
         "timestamp": hist.utc_now_iso(),
     }
+    if session_id is not None:
+        frame["session_id"] = session_id
+    if run_id is not None:
+        frame["run_id"] = run_id
+    return frame
 
 
 class Bridge:
@@ -284,10 +295,9 @@ class Bridge:
             self.config.EMOTIONS_FILE or None
         )
         self.tts.attach_manifest(self.emotions_manifest)
-        if self.config.TTS_VOICE_PROFILE_FILE.strip():
-            self.tts.set_voice_profile(
-                load_voice_profile(self.config.TTS_VOICE_PROFILE_FILE.strip())
-            )
+        self.tts.set_voice_profile(
+            load_voice_profile(self.config.TTS_VOICE_PROFILE_FILE.strip() or None)
+        )
         self.static_lines = load_static_lines(self.config.STATIC_LINES_FILE or None)
         # Three-tier memory (plan section 20): the durable Redis store of
         # record plus the optional Chroma index (degraded-safe).
@@ -2135,9 +2145,14 @@ class Bridge:
                 )
                 if source_conn is not None:
                     # No done frame on pause (plan 30.2); the status frame
-                    # carries the bounded question text.
+                    # carries the bounded question text and resume ids.
                     await source_conn.send_json(
-                        status_frame(pause_tag, message=paused_text[:200])
+                        status_frame(
+                            pause_tag,
+                            message=paused_text[:200],
+                            session_id=session_id_resolved,
+                            run_id=run_id,
+                        )
                     )
                 return {
                     "type": "paused",
@@ -2975,10 +2990,23 @@ class Bridge:
         spacing = max(self.config.TTS_CHUNK_SPACING_MS, 0) / 1000.0
         on_deck: list[asyncio.Task] = []
 
+        def run_index_for(index: int) -> int:
+            emotion = chunks[index]["emotion"]
+            run = 0
+            cursor = index - 1
+            while cursor >= 0 and chunks[cursor]["emotion"] == emotion:
+                run += 1
+                cursor -= 1
+            return run
+
         def start_next(index: int) -> None:
             on_deck.append(
                 asyncio.create_task(
-                    self.tts.synthesize(chunks[index]["text"], chunks[index]["emotion"])
+                    self.tts.synthesize(
+                        chunks[index]["text"],
+                        chunks[index]["emotion"],
+                        run_index_for(index),
+                    )
                 )
             )
 

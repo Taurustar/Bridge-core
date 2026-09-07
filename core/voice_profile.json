@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "default": {
+    "stability": 0.5,
+    "similarity_boost": 0.75,
+    "style": 0.0
+  },
+  "emotions": {
+    "excited": {"stability": 0.28, "style": 0.4},
+    "playful": {"stability": 0.3, "style": 0.35},
+    "happy": {"stability": 0.32, "style": 0.3},
+    "mischievous": {"stability": 0.3, "style": 0.35},
+    "angry": {"stability": 0.35, "style": 0.25},
+    "annoyed": {"stability": 0.38, "style": 0.2},
+    "surprised": {"stability": 0.34, "style": 0.28},
+    "loving": {"stability": 0.4, "style": 0.22},
+    "affectionate": {"stability": 0.4, "style": 0.22},
+    "confident": {"stability": 0.42, "style": 0.18},
+    "focused": {"stability": 0.5, "style": 0.05},
+    "neutral": {"stability": 0.5, "style": 0.0},
+    "serious": {"stability": 0.55, "style": 0.05},
+    "confused": {"stability": 0.48, "style": 0.08},
+    "worried": {"stability": 0.52, "style": 0.08},
+    "scared": {"stability": 0.52, "style": 0.1},
+    "embarrassed": {"stability": 0.5, "style": 0.12},
+    "shy": {"stability": 0.55, "style": 0.08},
+    "tired": {"stability": 0.58, "style": 0.05},
+    "sleepy": {"stability": 0.6, "style": 0.04},
+    "sad": {"stability": 0.55, "style": 0.1}
+  }
+}

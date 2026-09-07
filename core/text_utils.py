@@ -77,10 +77,10 @@ def _scrub(text: str) -> str:
 def parse_emotion_segments(raw: str) -> list[dict]:
     """Parse a reply into display-safe ``{"text", "emotion"}`` segments.
 
-    Text before the first tag becomes a neutral-emotion segment. Every
-    ``[EMOTION: name]`` tag starts a new segment and selects its emotion;
-    tags are stripped from the text. Empty segments are dropped, so an
-    emotion-only reply yields ``[]`` (the caller retries once, plan 7.3).
+    Text before the first tag inherits that tag's emotion (Akane contract,
+    v1.0.1). Every ``[EMOTION: name]`` tag starts a new segment and selects
+    its emotion; tags are stripped from the text. Empty segments are dropped,
+    so an emotion-only reply yields ``[]`` (the caller retries once, plan 7.3).
     """
     cleaned = strip_reasoning_blocks(raw)
     matches = list(_EMOTION_TAG_RE.finditer(cleaned))
@@ -89,9 +89,10 @@ def parse_emotion_segments(raw: str) -> list[dict]:
         return [{"text": text, "emotion": DEFAULT_EMOTION}] if text else []
 
     segments: list[dict] = []
+    first_emotion = normalize_emotion(matches[0].group(1))
     leading = _scrub(cleaned[: matches[0].start()])
     if leading:
-        segments.append({"text": leading, "emotion": DEFAULT_EMOTION})
+        segments.append({"text": leading, "emotion": first_emotion})
     for index, match in enumerate(matches):
         end = matches[index + 1].start() if index + 1 < len(matches) else len(cleaned)
         text = _scrub(cleaned[match.end() : end])
