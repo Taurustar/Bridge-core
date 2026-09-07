@@ -3,7 +3,7 @@
 Living implementation contract. It refines unspecified details of
 `BRIDGE_CORE_ENGINE_IMPLEMENTATION_PLAN.md`; it may not override locked
 decisions (plan section 2). Milestones implemented: **0.1.0** through
-**1.0.1** (emotion palette v2).
+**1.1.0** (outbound Discord gateway).
 
 ## Deviations from the plan
 
@@ -42,7 +42,12 @@ decisions (plan section 2). Milestones implemented: **0.1.0** through
   Milestone 0.7.0 adds `core/initiative.py` (heartbeat-initiative state,
   counting, cadence roll, delivery accounting) and `core/external_profiles.py`
   plus `core/routes/external_profiles.py` (dormant store and admin APIs).
-  Milestone 1.0.0 adds `deploy/bridge-core-engine.service` (systemd unit),
+   Milestone 1.1.0 adds the top-level `discord_adapter/` package (config,
+   allowlist, turns, media, adapter, sidecar). The directory is not named
+   `discord/` so it does not shadow PyPI `discord.py`. `core/` gains only a
+   generic `run_external_turn` hook and sibling `sidecar.py` discovery;
+   those files must not contain the token `discord`.
+   Milestone 1.0.0 adds `deploy/bridge-core-engine.service` (systemd unit),
   `scripts/validate_config.py` and `scripts/ws_smoke.py` (release tooling),
   `docs/DEPLOYMENT.md` / `docs/ENVIRONMENT.md` / `docs/OPERATIONS.md` /
   `docs/RELEASE_AUDIT.md`, and `tests/test_release.py` (release regression
@@ -213,11 +218,36 @@ decisions (plan section 2). Milestones implemented: **0.1.0** through
   - Listing uses the standard envelope, sorted `updated_ts desc,
     subject_id asc` (plan 29). The middleware maps Redis failures on
     `/profiles/external*` to structured `503 redis_unavailable`.
-  - `EXTERNAL_USER_PROFILES_BEHAVIOR_ENABLED` and
-    `EXTERNAL_USER_PROFILE_LLM_ENABLED` gate nothing today because no
-    gateway exists: no app prompt, turn update, or LLM analysis path reads
-    the store. They exist so a future gateway must flip explicit flags
-    before any behavior change (plan 19.4).
+  - `EXTERNAL_USER_PROFILES_BEHAVIOR_ENABLED` (default false) now gates
+    guest-block injection on `run_external_turn` (non-owner threads only).
+    The app companion path still never reads the store.
+    `EXTERNAL_USER_PROFILE_LLM_ENABLED` still gates nothing (no LLM
+    analysis of guest profiles).
+- **Outbound gateway (1.1.0)**, owner-approved post-v1 Discord adapter
+  (plan 2 excludes bots from v1; this milestone is an explicit revision):
+  - All Discord code lives under `discord_adapter/`. `tests/test_release.py`
+    still forbids the token `discord` in `core/` and `bridge_core.py`.
+  - `core/` adds `external_thread_key` /
+    `core:history:{owner}:{platform}:{thread_kind}:{thread_id}`
+    (`thread_kind` is `dm` or `channel`) and `Bridge.run_external_turn`.
+    Owner DMs set `join_owner_thread=True` and reuse
+    `core:history:{owner}:companion` plus app `chat_sync`. Other threads
+    skip owner soft-block, owner memory/context-feed, daily tools, MCP,
+    and the device daemon; character schedule busy/unavailable is silence
+    (static line if authored) with no owner deferred-queue write.
+  - Lifespan discovers sibling packages that ship `sidecar.py` and calls
+    `start(app)` / `stop(app)`. Missing `discord.env` or
+    `DISCORD_ENABLED=false` leaves the adapter idle and creates no extra
+    Redis keys.
+  - Guild replies require allowlisted guild **and** channel **and**
+    mention or reply-to-bot. Empty allowlists mean none, never all.
+  - Speech is voice-message / audio-file STT and an uploaded audio file
+    for TTS. No live voice channels. Vision is optional multimodal user
+    content with a text-only retry if the provider rejects the image.
+  - Per-author rate limit defaults to 8 events / 60s
+    (`DISCORD_RATE_MAX`, `DISCORD_RATE_WINDOW_SECONDS`).
+  - Optional extra: `pip install 'bridge-core-engine[discord]'` for
+    `discord.py`. Without the library the adapter logs and stays idle.
 - **Emotion alignment (1.0.1)**, owner-approved palette expansion (plan 13.1
   otherwise freezes v1 names):
   - `FINAL_EMOTIONS` gains `mischievous`, `loving`, `focused`. `working`
@@ -988,7 +1018,7 @@ integration tests):
   requests and replay scripted responses.
 - HTTP+WS tests use FastAPI's `TestClient`; no network, no live Redis.
 
-## Redis keys in 0.1.0–1.0.0
+## Redis keys in 0.1.0–1.1.0
 
 `core:history:{owner}:companion` (list of JSON rows: `id`, `role`, `text`,
 `emotion`, `ts`, `delivery_state`) is the only key a flags-off deployment
@@ -1009,12 +1039,12 @@ ON): `core:sessions:{owner}`, `core:projects:{owner}`,
 `core:mcp_response:{owner}:{request_id}` /
 `core:device_response:{owner}:{request_id}` (deleted after consumption),
 and `core:device:audit:{owner}` (metadata only; `DEVICE_ENABLED`).
-With 0.6.0: `core:midterm:{owner}:companion` (bounded chapter ring; appears once compaction first stores a chapter), `core:daily:reminders:{owner}` (DAILY_TOOLS_ENABLED reminder writes), and `core:daily:idempotency:{owner}` (executed mutation keys). `core:longterm:{owner}` rows beyond character life events appear when extraction or admin CRUD writes durable facts. With 0.7.0: `core:initiative:{owner}` (HEARTBEAT_ENABLED + INITIATIVE_ENABLED heartbeat counting) and `core:external_profile:{owner}:{platform}:{external_id}` (EXTERNAL_USER_PROFILE_STORE_ENABLED admin CRUD; no keys when the store is disabled). **Audio is never stored server-side** —
+With 0.6.0: `core:midterm:{owner}:companion` (bounded chapter ring; appears once compaction first stores a chapter), `core:daily:reminders:{owner}` (DAILY_TOOLS_ENABLED reminder writes), and `core:daily:idempotency:{owner}` (executed mutation keys). `core:longterm:{owner}` rows beyond character life events appear when extraction or admin CRUD writes durable facts. With 0.7.0: `core:initiative:{owner}` (HEARTBEAT_ENABLED + INITIATIVE_ENABLED heartbeat counting) and `core:external_profile:{owner}:{platform}:{external_id}` (EXTERNAL_USER_PROFILE_STORE_ENABLED admin CRUD; no keys when the store is disabled). With 1.1.0 outbound adapters: `core:history:{owner}:{platform}:{thread_kind}:{thread_id}` for non-owner DM/channel threads (`thread_kind` is `dm` or `channel`; covered by the existing `core:history:{owner}:*` wipe glob). Owner DMs do not create a new family — they write `core:history:{owner}:companion`. Flags-off or adapter-off deployments still create no extra keys. **Audio is never stored server-side** —
 audio bytes exist only in flight, and the STT/TTS paths write no keys. All
 other keys in plan section 28 belong to later milestones.
 
 ## Version source
 
-`core/constants.py::VERSION = "1.0.1"` is the single source; the entrypoint
+`core/constants.py::VERSION = "1.1.0"` is the single source; the entrypoint
 docstring, README, `connected` frame, and `/status` derive from it.
 `tests/test_release.py` pins `pyproject.toml` to the same value.

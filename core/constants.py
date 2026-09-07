@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-VERSION = "1.0.1"
+VERSION = "1.1.0"
 
 # ---------------------------------------------------------------------------
 # Emotion palette (plan section 13.1). Adding/removing/renaming a name
@@ -139,6 +139,16 @@ PENDING_UNKNOWN_THRESHOLD_SECONDS = 60
 def companion_history_key(owner_user_id: str) -> str:
     """The only Redis key milestones 0.1.0-0.2.0 create."""
     return f"core:history:{owner_user_id}:companion"
+
+
+EXTERNAL_THREAD_KINDS: tuple[str, ...] = ("dm", "channel")
+
+
+def external_thread_key(
+    owner_user_id: str, platform: str, thread_kind: str, thread_id: str
+) -> str:
+    """Separate history list for an outbound-adapter thread."""
+    return f"core:history:{owner_user_id}:{platform}:{thread_kind}:{thread_id}"
 
 
 def needs_key(owner_user_id: str) -> str:

@@ -1,6 +1,7 @@
 .venv/
 __pycache__/
 core.env
+discord.env
 data/
 *.pyc
 .DS_Store

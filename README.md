@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  <strong>Version 1.0.1</strong> — Self-hosted backend for a persistent character companion.<br>
+  <strong>Version 1.1.0</strong> — Self-hosted backend for a persistent character companion.<br>
   <em>Lightweight. General-purpose. Privacy-first.</em>
 </p>
 
@@ -40,7 +40,7 @@ Bridge is the **general-purpose, open-source core** born from a much more person
 
 # Akane vs. Bridge Core Engine — Feature & Technology Comparison
 
-**Compared on:** 2026-09-06
+**Compared on:** 2026-09-07
 
 Legend: ✅ full · 🟡 partial / simplified · ❌ absent · 🚫 absent by design · 🔜 in progress
 
@@ -73,6 +73,7 @@ Legend: ✅ full · 🟡 partial / simplified · ❌ absent · 🚫 absent by de
 |---|---|---|
 | TTS | ElevenLabs (chunked, emotion-aware) | ElevenLabs (chunked, sequential) |
 | STT | Deepgram (+ AssemblyAI) | Deepgram + AssemblyAI |
+| Emotion palette | 18 emotions + status emotions, per-chunk metadata | ✅ **expanded palette (aligned with Akane)** + per-emotion voice tuning profile (stability/style per emotion) |
 | Languages | EN / ES / JA + auto-translate | EN / ES / JA pins |
 | No-LLM fallback speech | 🟡 | ✅ owner-authored static lines |
 
@@ -93,7 +94,7 @@ Legend: ✅ full · 🟡 partial / simplified · ❌ absent · 🚫 absent by de
 | Needs engine | ✅ full | 🟡 simplified |
 | Appraisal / deep emotion cognition | ✅ | ❌ |
 | Autonomy engine (availability overlays, sleep interrupt) | ✅ | ❌ |
-| Proactive reach-out (initiative) | ✅ | 🟡 heartbeat-driven initiative — cadence-seeded, hard-suppressed by schedule/needs/soft block, model may answer SILENCE |
+| Proactive reach-out (initiative) | ✅ app + **Discord one-person reach-out** (scoped by server/channel, cadence caps, silent on failure) | 🟡 heartbeat-driven initiative — cadence-seeded, hard-suppressed by schedule/needs/soft block, SILENCE option |
 | Character schedule | ✅ dynamic | ✅ real-time, DST-safe |
 | Character life events | ✅ rich library | ✅ owner-authored templates |
 | Owner schedule & world-time awareness | ✅ | 🟡 |
@@ -104,7 +105,7 @@ Legend: ✅ full · 🟡 partial / simplified · ❌ absent · 🚫 absent by de
 
 | Feature | Akane | Bridge |
 |---|---|---|
-| Owner relationship profile | ✅ LLM-driven proposals | ✅ strict-JSON proposals |
+| Owner relationship profile | ✅ LLM-driven proposals, incl. clamped trust/closeness moves | ✅ strict-JSON proposals |
 | Boundaries + reversible soft block | ✅ | ✅ |
 | Binding agreements | ✅ | ✅ |
 | Agency / people-pleasing guards | ✅ | ❌ |
@@ -119,17 +120,18 @@ Legend: ✅ full · 🟡 partial / simplified · ❌ absent · 🚫 absent by de
 | Agent loop controls | ✅ iteration cap + visible "looking" status + let/ping/notify relay | ✅ bounded iterations + status frames |
 | Secret-shape scrubbing | ✅ | ✅ secret-path fences |
 | Web search | Tavily | Tavily (strict SSRF guards) |
-| Daily tools (reminders, silent checks) | ✅ | ✅ idempotency + intent gate |
+| Daily tools (reminders, silent checks) | ✅ + quiet helpers (small talk skips tool schemas; open channels get a basic tool set only) | ✅ idempotency + intent gate |
 
 ## Channels & Media
 
 | Capability | Akane | Bridge |
 |---|---|---|
-| Discord / WhatsApp (with safety layers) | ✅ | 🚫 no gateway (excluded by design) |
-| External-user profiles | ✅ live per-channel profiles + memory | 🟡 dormant profile store with guarded admin CRUD — foundation only, never injected into companion turns |
+| Discord | ✅ full bot — safety layers, weather, relay, @identity, one-person reach-out | 🟡 **new adapter (work in progress)** — guild/channel allowlists (empty = none), owner/stranger DM routing, rate limiting, optional STT/TTS/vision; no MCP or device daemon on Discord turns |
+| WhatsApp | ✅ full bot with safety layer + Node.js gateway | ❌ |
+| External-user profiles | ✅ live per-channel profiles + memory | 🟡 profile store + guarded admin CRUD; Discord adapter begins wiring them in |
 | Android | ✅ | ❌ |
 | Image & video generation | fal.ai (FLUX) | ❌ |
-| Vision (photo understanding) | ✅ | ❌ |
+| Vision (photo understanding) | ✅ | 🟡 Discord attachments only, flag-gated |
 
 ## Infrastructure & Security
 
@@ -140,13 +142,13 @@ Legend: ✅ full · 🟡 partial / simplified · ❌ absent · 🚫 absent by de
 | Observability | ✅ per-turn wall-clock timing telemetry | 🟡 non-secret status/diagnostics |
 | Deployment tooling | systemd service | ✅ full kit: systemd unit, deployment guide, ops runbook, config validator, WS smoke tests |
 | Feature gating | Mixed | Every optional subsystem off by default, flag-enabled |
-| Design-exclusion enforcement | — | ✅ test-enforced (no gateway/media/intimacy/appraisal code can sneak in) |
+| Design-exclusion enforcement | — | ✅ test-enforced at release (media/intimacy/appraisal excluded; Discord gateway now being added as the first sanctioned channel) |
 
 ---
 
 ## Bottom Line
 
-Bridge's initiative engine has arrived — proactive reach-out is no longer Akane-only, though Bridge's version is deliberately restrained (heartbeat-cadence, heavily suppressed) versus Akane's full autonomy engine. Akane's memory stack has leveled up to a true vector architecture (live pgvector + dedicated embedder + cabinet organization), which is now its clearest technical lead. Bridge's external-profile store lays dormant groundwork for public channels without shipping any gateway. Akane's exclusive territory remains: intimacy, autonomy/appraisal depth, live multi-channel presence, and media/vision. Technologies with no Bridge counterpart: Kimi, Qdrant/mem0, pgvector, PostgreSQL, and fal.ai.
+Bridge's speech layer has caught up to Akane's (expanded emotion palette with per-emotion voice tuning), and a **Discord adapter is now in active development** — allowlist-gated, rate-limited, with optional STT/TTS/vision but deliberately no MCP or device access on open-channel turns. The initiative engine and external-profile store round out the channel foundation. Akane still leads in channel maturity (safety layers, reach-out, weather, relay, WhatsApp, Android) and its vector memory architecture (live pgvector + embedder + cabinet) remains its clearest technical edge. Still Akane-only: intimacy, autonomy/appraisal depth, WhatsApp/Android, media generation, joint scheduling. Technologies with no Bridge counterpart: Kimi, Qdrant/mem0, pgvector/PostgreSQL, fal.ai.
 
 
 ---
@@ -298,12 +300,17 @@ profile. Real environment variables override file values. Invalid numeric or
 boolean values fail startup with a clear message. Secrets are never exposed
 via `/status` or logs.
 
+Optional Discord (v1.1.0): copy `discord_adapter/discord.env.template` to
+`discord.env`, set `DISCORD_ENABLED=true` and the bot token, and install
+`pip install 'bridge-core-engine[discord]'`. The adapter is outbound-only;
+Bridge bind stays Tailscale. Empty guild/channel allowlists mean none.
+
 Needs/interaction tuning (thresholds, rates, turn effects, bid caps, owner
 profile floors) lives in `schedule/needs.json` — the bundled values are
 engine-safe neutrals, not character calibration; tune them for your
 deployment.
 
-## Repository layout (milestone 1.0.0)
+## Repository layout (milestone 1.1.0)
 
 ```text
 bridge_core.py            entrypoint
@@ -373,6 +380,7 @@ life_events/              schema_example.disabled.json (inert; author your own)
 deploy/                   bridge-core-engine.service (systemd unit, plan 27.4)
 scripts/                  validate_config.py + ws_smoke.py (release tooling)
 docs/                     DEPLOYMENT / ENVIRONMENT / OPERATIONS / RELEASE_AUDIT
+discord_adapter/          outbound Discord gateway (sidecar; optional extra)
 tests/                    unittest suite (no live services required)
 ```
 
@@ -395,7 +403,9 @@ Milestone 0.6.0 scope: three-tier memory and private daily tools — mid-term ch
 
 Milestone 0.7.0 scope: heartbeat-driven initiative and the dormant external-user profile foundation — the initiative engine (`INITIATIVE_ENABLED`, default OFF): valid heartbeats count once per owner-global 60-second bucket no matter how many devices send, daily counters reset on the owner's civil day (`OWNER_TIMEZONE`), a `SHA-256` cadence roll over a private deployment seed (`INITIATIVE_SEED_FILE`, created once at `./data/initiative_seed`, never logged) decides eligibility so the engine never fires mechanically every Nth beat, and daily max / min gap / active turn / character schedule / critical needs / soft block (plus optional contextual owner-schedule sleep/busy via `INITIATIVE_RESPECT_OWNER_SCHEDULE`) all hard-suppress before generation. A candidate generates one short proactive message (deterministic reason: pending life mention, bond need, low fun, or a recent open thread; the model may answer `SILENCE`, which delivers nothing and counts nothing) and delivers through the standard pending/delivery protocol under the owner history lock: the `done` frame and `chat_sync` carry additive `initiative`/`initiative_action`/`initiated_by` origin metadata, counters advance and a connection bid registers only after source delivery plus delivered-history persistence, and `heartbeat_ack.initiative_counter` now reports the live heartbeat count (still `0` with the engine off). Webhook completion: startup reconciliation turns stale `pending` assistant rows into `delivery_unknown`, and a WS `message_ack` moves a matching row to `delivered` (idempotent). Dormant gateway profiles (plan section 19): `core:external_profile:{owner}:{platform}:{external_id}` documents with admin CRUD at `GET/POST/PATCH/DELETE /profiles/external[/...]` under the `UPDATE_EXTERNAL_PROFILE` / `DELETE_EXTERNAL_PROFILE` mistake guards — `EXTERNAL_USER_PROFILE_STORE_ENABLED=false` answers `409 feature_disabled` and creates no keys, and with the store on but behavior off (default) nothing in the app or any LLM path ever reads the records.
 
-Milestone 1.0.0 scope (current, release): operations and release hardening — a deployable systemd unit (`deploy/bridge-core-engine.service`: dedicated user, `EnvironmentFile=`, restart-on-failure, SIGTERM, journald, Redis/tailscaled ordering), the end-to-end Tailscale deployment guide (`docs/DEPLOYMENT.md`: network model, bind decision, firewall, tested ACL examples, health checks, upgrades), the full environment reference (`docs/ENVIRONMENT.md`; release tests enforce every config field is documented), the day-2 runbook (`docs/OPERATIONS.md`), the config validation script (`scripts/validate_config.py`, exit-coded, never prints secrets) and WS smoke script (`scripts/ws_smoke.py`, /health + connected + heartbeat_ack + error paths + foreign-user rejection), the resource cleanup and deadline audit (`docs/RELEASE_AUDIT.md`; found and fixed Chroma blocking ops moving from the default thread pool to a dedicated single-thread executor per plan 6.1), the excluded-forever audit (no gateway/media/intimacy/appraisal/reflection/SER/loop/auth code — test-enforced), and the completed regression suite (release tests pin version sources, documentation completeness, wipe coverage of every documented Redis key, and a fully inert flags-off boot).
+Milestone 1.1.0 scope (current): optional outbound Discord adapter (`discord_adapter/`, extra `bridge-core-engine[discord]`). Owner DMs join the companion thread; stranger DMs and allowlisted mention/reply channels use separate history keys. Voice-message STT/TTS and optional vision. No Discord knowledge in `core/`. Flags off: adapter does not start.
+
+Milestone 1.0.0 scope (release hardening): operations and release hardening — a deployable systemd unit (`deploy/bridge-core-engine.service`: dedicated user, `EnvironmentFile=`, restart-on-failure, SIGTERM, journald, Redis/tailscaled ordering), the end-to-end Tailscale deployment guide (`docs/DEPLOYMENT.md`: network model, bind decision, firewall, tested ACL examples, health checks, upgrades), the full environment reference (`docs/ENVIRONMENT.md`; release tests enforce every config field is documented), the day-2 runbook (`docs/OPERATIONS.md`), the config validation script (`scripts/validate_config.py`, exit-coded, never prints secrets) and WS smoke script (`scripts/ws_smoke.py`, /health + connected + heartbeat_ack + error paths + foreign-user rejection), the resource cleanup and deadline audit (`docs/RELEASE_AUDIT.md`; found and fixed Chroma blocking ops moving from the default thread pool to a dedicated single-thread executor per plan 6.1), the excluded-forever audit (no gateway/media/intimacy/appraisal/reflection/SER/loop/auth code — test-enforced), and the completed regression suite (release tests pin version sources, documentation completeness, wipe coverage of every documented Redis key, and a fully inert flags-off boot).
 
 Speech flags (`TTS_ENABLED`, `STT_ENABLED`) and the 0.3.0/0.4.0 flags
 (`NEEDS_ENABLED`, `BIDS_ENABLED`, `RHYTHM_ENABLED`, `STATE_EXPRESSION_ENABLED`,

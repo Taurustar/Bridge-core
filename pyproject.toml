@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "bridge-core-engine"
-version = "1.0.1"
+version = "1.1.0"
 description = "Self-hosted backend for a persistent character companion (single-owner, Tailscale-only)"
 readme = "README.md"
 requires-python = ">=3.11,<3.14"
@@ -20,9 +20,10 @@ dependencies = [
 
 [project.optional-dependencies]
 chroma = ["chromadb>=0.5"]
+discord = ["discord.py>=2.4"]
 
 [tool.setuptools]
-packages = ["core", "core.routes"]
+packages = ["core", "core.routes", "discord_adapter"]
 
 [tool.setuptools.package-data]
 core = ["emotions.json", "static_lines.json"]
