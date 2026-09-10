@@ -730,8 +730,16 @@ class MemoryBackend:
             if isinstance(chapter, dict):
                 rows.append(chapter)
         rows.extend(extra_rows or [])
+        # A row id may appear in more than one source (durable ring, chapter
+        # ring, or extra_rows). Chroma upsert requires unique ids; keep the
+        # last copy so the freshest row wins.
+        deduped: dict[str, dict] = {}
+        for row in rows:
+            if row.get("id"):
+                deduped[str(row["id"])] = row
+        rows = list(deduped.values())
         try:
-            desired_ids = {str(row["id"]) for row in rows if row.get("id")}
+            desired_ids = set(deduped)
             stale_ids = (
                 set(await run_chroma_call(self.chroma.ids, owner)) - desired_ids
             )

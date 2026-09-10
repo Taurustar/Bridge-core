@@ -229,3 +229,21 @@ time one projection may consume.
 |---|---|---|
 | `SOUL_FILE` / `PROFILE_FILE` / `STATE_FILE` | `` | Identity file overrides (repo defaults under `identity/`, blank-heading templates). The engine never writes these. |
 | `EMOTIONS_FILE` / `STATIC_LINES_FILE` | `` | Manifest overrides (bundled neutral defaults ship in `core/`). |
+
+## Discord adapter (v1.1.0, not `core.env`)
+
+These live in `discord.env` (see `discord_adapter/discord.env.template`). They are
+not `Config` fields. Missing file or `DISCORD_ENABLED=false` leaves the
+adapter idle. The bot token is never in `/status` or INFO logs.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `DISCORD_ENABLED` | `false` | Master switch. |
+| `DISCORD_BOT_TOKEN` | `` | Bot token. Secret. |
+| `DISCORD_GUILD_IDS` / `DISCORD_CHANNEL_IDS` | `` | Allowlists. Empty = none. |
+| `DISCORD_DM_OWNER_ENABLED` | `false` | Owner DMs join the companion thread. |
+| `DISCORD_DM_STRANGERS_ENABLED` | `false` | Stranger DMs get a separate history list. |
+| `DISCORD_OWNER_USER_ID` | `` | Owner Discord snowflake. |
+| `DISCORD_STT_ENABLED` / `DISCORD_TTS_ENABLED` | `false` | Voice-message files, not live voice. |
+| `DISCORD_VISION_ENABLED` | `false` | Attach images to the turn when the model accepts them. |
+| `DISCORD_RATE_MAX` / `DISCORD_RATE_WINDOW_SECONDS` | `8` / `60` | Per-author rate limit. |

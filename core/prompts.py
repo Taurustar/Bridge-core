@@ -12,6 +12,8 @@ numeric scores.
 
 from __future__ import annotations
 
+import base64
+
 # Structural prompt laws (plan section 7.3). Engine behavior only — no
 # character personality, names, or backstory may ever be added here.
 STRUCTURAL_LAWS = """\
@@ -25,6 +27,25 @@ STRUCTURAL_LAWS = """\
 """
 
 
+def user_message_content(
+    text: str,
+    image_bytes: bytes | None = None,
+    image_mime: str = "",
+) -> str | list[dict]:
+    """User turn content. Optional image becomes a multimodal part."""
+    if not image_bytes:
+        return text
+    mime = image_mime.strip() or "image/png"
+    encoded = base64.b64encode(image_bytes).decode("ascii")
+    return [
+        {"type": "text", "text": text},
+        {
+            "type": "image_url",
+            "image_url": {"url": f"data:{mime};base64,{encoded}"},
+        },
+    ]
+
+
 def build_companion_prompt(
     *,
     soul_text: str,
@@ -36,6 +57,7 @@ def build_companion_prompt(
     owner_block: str = "",
     awareness_block: str = "",
     context_feed: str = "",
+    extra_block: str = "",
     soft_busy_note: bool = False,
 ) -> list[dict]:
     """Build the chat-completions message list for a companion turn.
@@ -59,6 +81,8 @@ def build_companion_prompt(
         system_parts.append(awareness_block.strip())
     if context_feed.strip():
         system_parts.append(context_feed.strip())
+    if extra_block.strip():
+        system_parts.append(extra_block.strip())
     if soft_busy_note:
         system_parts.append(
             "[AVAILABILITY]\nYou are only semi-available right now; keep the "

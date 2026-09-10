@@ -413,6 +413,56 @@ class DegradedChromaTest(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_reconcile_dedupes_rows_seen_in_more_than_one_source(self):
+        # Regression: the same record id can live in the durable ring and the
+        # chapter ring (or arrive via extra_rows). Chroma upsert rejects
+        # duplicate ids; reconcile must dedupe instead of failing startup.
+        cache, fake = make_cache()
+        config = make_config(CHROMA_ENABLED=True)
+        backend = MemoryBackend(config, cache)
+        chroma = FakeChroma()
+        backend.chroma = chroma
+
+        async def run():
+            row = life_record(backend, "durable row")
+            await backend.redis.add("owner", row)
+            from core.constants import midterm_key
+
+            # Same id re-appears in the chapter ring and via extra_rows.
+            await backend.redis.cache.append_row(
+                midterm_key("owner"), __import__("json").dumps(dict(row)), 200
+            )
+            chroma.start()
+            await backend.reconcile_owner("owner", extra_rows=[dict(row)])
+            # Exactly one indexed copy, owner reconciled, no crash.
+            self.assertEqual(
+                [rid for rid in chroma.ids("owner") if rid == row["id"]],
+                [row["id"]],
+            )
+            self.assertIn("owner", backend._reconciled_owners)
+
+        asyncio.run(run())
+
+    def test_reconcile_keeps_the_freshest_copy_of_a_duplicate_id(self):
+        # Later sources win (chapters, then extra_rows are appended after the
+        # durable ring), so the freshest row content is what gets indexed.
+        cache, fake = make_cache()
+        config = make_config(CHROMA_ENABLED=True)
+        backend = MemoryBackend(config, cache)
+        chroma = FakeChroma()
+        backend.chroma = chroma
+
+        async def run():
+            stale = life_record(backend, "stale copy")
+            await backend.redis.add("owner", stale)
+            fresh = dict(stale)
+            fresh["text"] = "fresh copy"
+            chroma.start()
+            await backend.reconcile_owner("owner", extra_rows=[fresh])
+            self.assertEqual(chroma.indexed[stale["id"]]["text"], "fresh copy")
+
+        asyncio.run(run())
+
     def test_chroma_failure_degrades_without_breaking_redis(self):
         cache, fake = make_cache()
         config = make_config(CHROMA_ENABLED=True)

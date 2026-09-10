@@ -354,6 +354,7 @@ class WipeRouteTest(unittest.TestCase):
         documented = [
             "core:history:owner:companion",
             "core:history:owner:session:ses_1",
+            "core:history:owner:chat:dm:77",
             "core:midterm:owner:companion",
             "core:longterm:owner",
             "core:needs:owner",

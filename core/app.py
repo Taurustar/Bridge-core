@@ -10,8 +10,11 @@ HTTP error responses use the standard shape
 
 from __future__ import annotations
 
+import importlib
+import inspect
 import logging
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI, Request, WebSocket
 from fastapi.exceptions import RequestValidationError
@@ -28,6 +31,30 @@ from .speech import STTService, TTSService
 from .tailscale import validate_bind
 
 log = logging.getLogger("bridge.app")
+
+
+async def _run_sidecars(app: FastAPI, method: str) -> None:
+    """Start/stop optional sibling packages that ship a sidecar.py."""
+    root = Path(__file__).resolve().parent.parent
+    for path in sorted(root.iterdir()):
+        if not path.is_dir() or not path.name.isidentifier():
+            continue
+        if not (path / "sidecar.py").is_file():
+            continue
+        try:
+            module = importlib.import_module(f"{path.name}.sidecar")
+        except Exception:
+            log.warning("optional sidecar failed to import", exc_info=True)
+            continue
+        func = getattr(module, method, None)
+        if func is None:
+            continue
+        try:
+            result = func(app)
+            if inspect.isawaitable(result):
+                await result
+        except Exception:
+            log.warning("optional sidecar %s failed", method, exc_info=True)
 
 
 def error_body(code: str, message: str, details: dict | None = None) -> dict:
@@ -74,7 +101,9 @@ def create_app(
             enabled or ["none"],
             [f"{r.provider}/{r.model or '-'}" for r in bridge.llm.routes_for("companion")],
         )
+        await _run_sidecars(app, "start")
         yield
+        await _run_sidecars(app, "stop")
         await bridge.shutdown()
         await cache.close()
 

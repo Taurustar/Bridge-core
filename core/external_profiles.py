@@ -1,7 +1,9 @@
 """Dormant external-user profiles (plan section 19).
 
-Store and admin APIs only — no gateway ships in v1 and the app companion
-path never reads, updates, analyzes, or injects these records.
+Store and admin APIs. The app companion path never reads, updates,
+analyzes, or injects these records. Outbound adapters may inject a
+bounded prompt block when ``EXTERNAL_USER_PROFILES_BEHAVIOR_ENABLED``
+is on. ``EXTERNAL_USER_PROFILE_LLM_ENABLED`` still gates nothing.
 
 - Identity key: ``platform:external_id`` where ``platform`` is lowercase
   ASCII ``[a-z0-9_-]{1,24}`` and ``external_id`` is the adapter's canonical
@@ -103,6 +105,25 @@ def validate_external_id(raw: object) -> str:
 
 def subject_id(platform: str, external_id: str) -> str:
     return f"{platform}:{external_id}"
+
+
+def prompt_block(profile: dict) -> str:
+    """Bounded guest context for an outbound-adapter turn. Empty if unused."""
+    if not isinstance(profile, dict):
+        return ""
+    lines = ["[GUEST]"]
+    name = str(profile.get("display_name") or "").strip()
+    if name:
+        lines.append(f"Name: {name[:DISPLAY_NAME_MAX_CHARS]}")
+    summary = str(profile.get("summary") or "").strip()
+    if summary:
+        lines.append(summary[:SUMMARY_MAX_CHARS])
+    tone = str(profile.get("tone") or "").strip()
+    if tone and tone != "neutral":
+        lines.append(f"Tone: {tone[:TONE_MAX_CHARS]}")
+    if len(lines) == 1:
+        return ""
+    return "\n".join(lines)
 
 
 def default_profile(platform: str, external_id: str) -> dict:

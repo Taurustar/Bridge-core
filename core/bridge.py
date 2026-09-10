@@ -61,6 +61,7 @@ from .connections import Connection, ConnectionManager
 from .constants import (
     DEFAULT_EMOTION,
     DAILY_TOOL_RESULT_MAX_CHARS,
+    EXTERNAL_THREAD_KINDS,
     HEARTBEAT_MAX_AGE_SECONDS,
     HEARTBEAT_MAX_FUTURE_SECONDS,
     INITIATIVE_COUNTER_STUB,
@@ -72,6 +73,7 @@ from .constants import (
     SUPPORTED_LANGUAGES,
     VERSION,
     agent_run_key,
+    external_thread_key,
     pending_agent_key,
 )
 from .context_feed import (
@@ -89,7 +91,13 @@ from .daily_tools import (
 )
 from .device import DeviceManager
 from .emotions import load_emotions_manifest
-from .external_profiles import ExternalProfileStore
+from .external_profiles import (
+    ExternalProfileError,
+    ExternalProfileStore,
+    prompt_block,
+    validate_external_id,
+    validate_platform,
+)
 from .interaction import DeferredQueue
 from .initiative import (
     BID_KIND_BY_ACTION,
@@ -128,6 +136,7 @@ from .prompts import (
     build_session_summary_prompt,
     build_work_catchup_prompt,
     build_work_prompt,
+    user_message_content,
 )
 from .rhythm import RhythmEngine
 from .schedule import Schedule
@@ -2631,11 +2640,14 @@ class Bridge:
         language: str,
         source_conn: Connection | None,
         wants_audio: bool = False,
+        image_bytes: bytes | None = None,
+        image_mime: str = "",
     ) -> dict:
         """Run one text companion turn. Returns the terminal frame.
 
         ``source_conn`` is None for HTTP-originated turns, where returning the
-        response body is the delivery path.
+        response body is the delivery path. Optional image bytes become a
+        multimodal user part; a failed vision call retries text-only.
         """
         owner = self.config.OWNER_USER_ID
 
@@ -2746,6 +2758,15 @@ class Bridge:
                 context_feed=blocks["context_feed"] or blocks["chapter_block"],
                 soft_busy_note=soft_busy_note,
             )
+            plain_messages = messages
+            if image_bytes:
+                messages = [dict(item) for item in messages]
+                messages[-1] = {
+                    "role": "user",
+                    "content": user_message_content(
+                        text.strip(), image_bytes, image_mime
+                    ),
+                }
 
             wants_analysis = bool(
                 self.owner_profile.available and self.config.OWNER_PROFILE_LLM_ENABLED
@@ -2762,16 +2783,32 @@ class Bridge:
 
             try:
                 result = await self._companion_tool_loop(messages, text.strip())
-            except LLMChainExhausted as exc:
-                log.error("Companion turn failed: LLM chain exhausted")
-                frame = error_frame(
-                    "llm_unavailable",
-                    "No LLM provider could produce a reply.",
-                    terminal=True,
-                )
-                if source_conn is not None:
-                    await source_conn.send_json(frame)
-                return frame
+            except LLMChainExhausted:
+                if image_bytes:
+                    try:
+                        result = await self._companion_tool_loop(
+                            plain_messages, text.strip()
+                        )
+                    except LLMChainExhausted:
+                        log.error("Companion turn failed: LLM chain exhausted")
+                        frame = error_frame(
+                            "llm_unavailable",
+                            "No LLM provider could produce a reply.",
+                            terminal=True,
+                        )
+                        if source_conn is not None:
+                            await source_conn.send_json(frame)
+                        return frame
+                else:
+                    log.error("Companion turn failed: LLM chain exhausted")
+                    frame = error_frame(
+                        "llm_unavailable",
+                        "No LLM provider could produce a reply.",
+                        terminal=True,
+                    )
+                    if source_conn is not None:
+                        await source_conn.send_json(frame)
+                    return frame
 
             segments = parse_emotion_segments(result.text)
             if not _has_spoken_text(segments):
@@ -2906,6 +2943,171 @@ class Bridge:
             self.background_tasks.add(compact_task)
             compact_task.add_done_callback(self.background_tasks.discard)
         return done
+
+    async def run_external_turn(
+        self,
+        *,
+        platform: str,
+        external_id: str,
+        text: str,
+        language: str,
+        thread_kind: str,
+        thread_id: str,
+        join_owner_thread: bool = False,
+        image_bytes: bytes | None = None,
+        image_mime: str = "",
+    ) -> dict:
+        """Run one outbound-adapter turn. Never invokes MCP or the device daemon.
+
+        ``join_owner_thread`` reuses the companion pipeline (soft block,
+        schedule defer, device fan-out). Other threads use a separate
+        history list, skip owner soft-block and owner memory, and never
+        fan out to app devices.
+        """
+        try:
+            platform = validate_platform(platform)
+            external_id = validate_external_id(external_id)
+            thread_id = validate_external_id(thread_id)
+        except ExternalProfileError as exc:
+            return error_frame("bad_request", str(exc), terminal=True)
+        kind = str(thread_kind or "").strip().lower()
+        if kind not in EXTERNAL_THREAD_KINDS:
+            return error_frame(
+                "bad_request", "thread_kind must be dm or channel.", terminal=True
+            )
+        if language not in SUPPORTED_LANGUAGES:
+            language = self.config.DEFAULT_LANGUAGE
+        if join_owner_thread:
+            return await self.run_companion_turn(
+                text=text,
+                language=language,
+                source_conn=None,
+                image_bytes=image_bytes,
+                image_mime=image_mime,
+            )
+        owner = self.config.OWNER_USER_ID
+        if not text.strip():
+            return error_frame(
+                "empty_input", "Message text must not be empty.", terminal=True
+            )
+        availability = await self._effective_availability(owner)
+        if availability in ("busy", "unavailable"):
+            done: dict[str, Any] = {
+                "type": "done",
+                "id": hist.new_message_id(),
+                "mode": "companion",
+                "emotion": DEFAULT_EMOTION,
+                "ignored": True,
+                "reason": availability,
+                "initiated_by": "user",
+            }
+            line = get_static_line(self.static_lines, availability, language)
+            if line:
+                done["text"] = line
+                done["segments"] = [{"text": line, "emotion": DEFAULT_EMOTION}]
+            return done
+        history_key = external_thread_key(owner, platform, kind, thread_id)
+        lock = self.connections.turn_lock(owner)
+        async with lock:
+            user_row = hist.make_row("user", text.strip(), hist.DELIVERED)
+            await hist.append_row_to(
+                self.cache, history_key, user_row, self.config.MAX_HISTORY_TURNS
+            )
+            prompt_history = await hist.load_prompt_history(
+                self.cache,
+                owner,
+                self.config.LLM_HISTORY_MESSAGE_BUDGET,
+                exclude_id=user_row["id"],
+                key=history_key,
+            )
+            guest = ""
+            if (
+                self.config.EXTERNAL_USER_PROFILES_BEHAVIOR_ENABLED
+                and self.external_profiles.available
+            ):
+                profile = await self.external_profiles.get(
+                    owner, platform, external_id
+                )
+                if profile:
+                    guest = prompt_block(profile)
+            messages = build_companion_prompt(
+                soul_text=self._read_identity("soul"),
+                profile_text=self._read_identity("profile"),
+                history=prompt_history,
+                current_text=text.strip(),
+                language=language,
+                extra_block=guest,
+            )
+            plain = messages
+            if image_bytes:
+                messages = [dict(item) for item in messages]
+                messages[-1] = {
+                    "role": "user",
+                    "content": user_message_content(
+                        text.strip(), image_bytes, image_mime
+                    ),
+                }
+            try:
+                result = await self.llm.chat("companion", messages)
+            except LLMChainExhausted:
+                if image_bytes:
+                    try:
+                        result = await self.llm.chat("companion", plain)
+                    except LLMChainExhausted:
+                        return error_frame(
+                            "llm_unavailable",
+                            "No LLM provider could produce a reply.",
+                            terminal=True,
+                        )
+                else:
+                    return error_frame(
+                        "llm_unavailable",
+                        "No LLM provider could produce a reply.",
+                        terminal=True,
+                    )
+            segments = parse_emotion_segments(result.text)
+            if not _has_spoken_text(segments):
+                try:
+                    retry = await self.llm.chat("companion", plain)
+                    result = self._merge_usage(result, retry)
+                    segments = parse_emotion_segments(retry.text)
+                except LLMChainExhausted:
+                    pass
+            if not _has_spoken_text(segments):
+                return error_frame(
+                    "empty_reply",
+                    "The provider returned an empty reply.",
+                    terminal=True,
+                )
+            reply_text = join_segments(segments)
+            emotion = segments[0]["emotion"]
+            assistant_row = hist.make_row(
+                "assistant", reply_text, hist.PENDING, emotion=emotion
+            )
+            await hist.append_row_to(
+                self.cache, history_key, assistant_row, self.config.MAX_HISTORY_TURNS
+            )
+            await hist.mark_delivery_state_key(
+                self.cache, history_key, assistant_row["id"], hist.DELIVERED
+            )
+            done = {
+                "type": "done",
+                "id": assistant_row["id"],
+                "text": reply_text,
+                "emotion": emotion,
+                "segments": [dict(segment) for segment in segments],
+                "mode": "companion",
+                "provider": result.provider,
+                "model": result.model,
+                "initiated_by": "user",
+            }
+            if result.usage:
+                done["tokens"] = {
+                    "prompt": result.usage.get("prompt_tokens", 0),
+                    "completion": result.usage.get("completion_tokens", 0),
+                    "total": result.usage.get("total_tokens", 0),
+                }
+            return done
 
     def _start_profile_analysis(
         self, owner: str, exchange: dict, prompt_profile: dict | None
